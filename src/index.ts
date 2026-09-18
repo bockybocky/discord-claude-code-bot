@@ -1,0 +1,5050 @@
+import fs from "node:fs";
+import path from "node:path";
+
+// Manually parse --env-file argument to forcefully override existing environment variables
+// (Node.js --env-file does not override system variables, which causes conflicts if globally set)
+const envFileArg = process.execArgv.find(arg => arg.startsWith('--env-file='));
+if (envFileArg) {
+  const envFilePath = envFileArg.split('=')[1];
+  try {
+    const envContent = fs.readFileSync(envFilePath, 'utf8');
+    for (const line of envContent.split('\n')) {
+      const match = line.match(/^\s*([\w.-]+)\s*=\s*(.*)?\s*$/);
+      if (match) {
+        const key = match[1];
+        let value = match[2] || '';
+        // Remove trailing comments and whitespace
+        value = value.replace(/\s*#.*$/, '').trim();
+        if (value.startsWith('"') && value.endsWith('"')) value = value.slice(1, -1);
+        else if (value.startsWith("'") && value.endsWith("'")) value = value.slice(1, -1);
+        process.env[key] = value;
+      }
+    }
+  } catch (err) {
+    console.error(`[discord-cc-bot] Failed to read ${envFilePath}:`, err);
+  }
+}
+
+import crypto from "node:crypto";
+import { spawn, execFile, type ChildProcess } from "node:child_process";
+import os from "node:os";
+import cron from "node-cron";
+import Database from "better-sqlite3";
+import {
+  Client, GatewayIntentBits, Events, Partials, ChannelType,
+  REST, Routes, SlashCommandBuilder,
+  ActionRowBuilder, ButtonBuilder, ButtonStyle,
+  StringSelectMenuBuilder, StringSelectMenuOptionBuilder,
+  type Message, type Collection, type Snowflake,
+} from "discord.js";
+import {
+  postProcessSelinaOutput,
+  formatActionFootnote,
+  buildMorningBrief,
+  buildWeeklyDigest,
+  renderAuditTicker,
+  renderHoldingsOverview,
+  renderUpcomingEvents,
+  dmCharlesOnError,
+  SELINA_EXT_ENABLED,
+  setSelinaDb,
+  buildSelinaPlanPrompt,
+  renderRecentTasks,
+  renderSelinaReview,
+  renderSelinaCapabilities,
+  renderGeoInsight,
+  renderSelinaSeminar,
+  renderAdversarialReview,
+  renderRescueDispatch,
+} from "./selina-extensions.js";
+import { registerEarningsCard, isEarningsCommand } from "./selina-earnings-card.js";
+import { initC2CTaskTable } from "./lib/c2c-protocol.js";
+import {
+  postProcessAthenaOutput,
+  formatAthenaActionFootnote,
+  renderLatestAthenaInsight,
+  ATHENA_EXT_ENABLED,
+} from "./athena-extensions.js";
+import { noteAthenaTurn, loadAthenaCuratedBody } from "./athena-curator.js";
+import {
+  renderHandoff as irisRenderHandoff,
+  renderHoldings as irisRenderHoldings,
+  runRecall as irisRunRecall,
+  runKaigong as irisRunKaigong,
+  renderAuditStub as irisRenderAuditStub,
+  runSectorSummary as irisRunSectorSummary,
+  renderAaii as irisRenderAaii,
+  validateTicker as irisValidateTicker,
+} from "./iris-extensions.js";
+import {
+  tryAcquireLight as irisAcquireLight,
+  tryAcquireHeavy as irisAcquireHeavy,
+  renderStatus as irisRenderStatus,
+  acquireTickerLock as irisAcquireTickerLock,
+  releaseTickerLock as irisReleaseTickerLock,
+} from "./iris-concurrency.js";
+import { runGrokOnce, runAgyOnce, runResilientOneshot, ENGINE_CAPABILITIES, GROK_MODEL } from "./backends.js";
+import "reflect-metadata";
+import { SapphireClient } from "@sapphire/framework";
+import { runDiscordxInteraction } from "./lib/discordx-host.js";
+import { executeConversationTurn, type TurnDeps } from "./turn-execution.js";
+import { setAthenaRuntime, SAPPHIRE_ATHENA_COMMANDS } from "./lib/athena-runtime.js";
+import { loadAthenaSapphireCommands } from "./lib/load-athena-sapphire.js";
+import { SessionLifecycle } from "./session-lifecycle.js";
+import { readAthenaExecutionPolicy, buildClaudeSpawnArgs } from "./execution-policy.js";
+import { createAthenaCapabilities, parseCalendarIntent, parseMailIntent, confirmButtons, isSensitivePath } from "./capabilities.js";
+import { parseCalendarCandidate } from "./calendar-intent.js";
+import { extraAthenaSlashCommands, EXTRA_ATHENA_HELP, dispatchExtraAthenaCommand } from "./command-registry.js";
+import {
+  renderAthenaHoldings,
+  renderAthenaToday,
+  renderAthenaScout,
+  renderAthenaStatus,
+  compactCompanyBrief,
+  runAthenaQmd,
+  matchAthenaPhoneIntent,
+  ATHENA_PHONE_HELP,
+} from "./athena-mobile.js";
+import { maybeKnowledgeCard } from "./athena-search.js";
+import {
+  resolveEnabledEngines,
+  parsePassthroughCommand,
+  runPassthrough,
+  formatPassthroughReply,
+  chunkForDiscord,
+  logPassthrough,
+  ensureWorkdir,
+  type PassthroughEngine,
+} from "./passthrough.js";
+
+// --- ThreadMap (SQLite-backed) ---
+
+type ThreadEntry = {
+  sessionId: string;
+  cwd: string;
+  model: string;
+  createdAt: number;
+  started: boolean;
+  lastBotMessageId?: string;
+  isLocalResume?: boolean;
+};
+
+type ThreadMap = Record<string, ThreadEntry>;
+
+// Use persona-specific DB to prevent IrisBot/SelinaBot from sharing state
+const PERSONA_SUFFIX = process.env.PERSONA ? `-${process.env.PERSONA}` : "";
+const DB_PATH = path.join(import.meta.dirname, "..", `threads${PERSONA_SUFFIX}.db`);
+const JSON_PATH = path.join(import.meta.dirname, "..", "thread-map.json");
+
+const db = new Database(DB_PATH);
+db.pragma("journal_mode = WAL");
+const life = new SessionLifecycle(DB_PATH);
+const execPolicy = readAthenaExecutionPolicy();
+const caps = createAthenaCapabilities(life, execPolicy);
+console.log(`[discord-cc-bot] execution policy: chat=${execPolicy.chatEngine} skipPermissions=${execPolicy.allowSkipPermissions}`);
+
+db.exec(`CREATE TABLE IF NOT EXISTS threads (
+  threadId TEXT PRIMARY KEY,
+  sessionId TEXT NOT NULL,
+  cwd TEXT NOT NULL,
+  model TEXT NOT NULL,
+  createdAt INTEGER NOT NULL,
+  started INTEGER NOT NULL DEFAULT 0,
+  lastBotMessageId TEXT,
+  isLocalResume INTEGER NOT NULL DEFAULT 0
+)`);
+
+// Migration: add isLocalResume column if missing
+try { db.exec("ALTER TABLE threads ADD COLUMN isLocalResume INTEGER NOT NULL DEFAULT 0"); } catch { /* already exists */ }
+
+// Initialize C2C task state machine table
+initC2CTaskTable(db);
+if ((process.env.PERSONA ?? "").toLowerCase() === "selina") {
+  setSelinaDb(db);
+}
+
+// One-time migration from JSON → SQLite
+if (fs.existsSync(JSON_PATH)) {
+  try {
+    const old: ThreadMap = JSON.parse(fs.readFileSync(JSON_PATH, "utf8"));
+    const insert = db.prepare(
+      `INSERT OR IGNORE INTO threads (threadId, sessionId, cwd, model, createdAt, started, lastBotMessageId)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    );
+    const migrate = db.transaction(() => {
+      for (const [tid, e] of Object.entries(old)) {
+        insert.run(tid, e.sessionId, e.cwd, e.model, e.createdAt, e.started ? 1 : 0, e.lastBotMessageId ?? null);
+      }
+    });
+    migrate();
+    fs.renameSync(JSON_PATH, JSON_PATH + ".bak");
+    console.log(`[discord-cc-bot] migrated ${Object.keys(old).length} threads from JSON → SQLite`);
+  } catch (err) {
+    console.error("[discord-cc-bot] JSON migration failed:", err);
+  }
+}
+
+// Prepared statements
+const stmtGet = db.prepare("SELECT * FROM threads WHERE threadId = ?");
+const stmtUpsert = db.prepare(
+  `INSERT OR REPLACE INTO threads (threadId, sessionId, cwd, model, createdAt, started, lastBotMessageId, isLocalResume)
+   VALUES (@threadId, @sessionId, @cwd, @model, @createdAt, @started, @lastBotMessageId, @isLocalResume)`,
+);
+const stmtAll = db.prepare("SELECT * FROM threads");
+
+function rowToEntry(row: any): ThreadEntry {
+  return {
+    sessionId: row.sessionId,
+    cwd: row.cwd,
+    model: row.model,
+    createdAt: row.createdAt,
+    started: !!row.started,
+    lastBotMessageId: row.lastBotMessageId ?? undefined,
+    isLocalResume: !!row.isLocalResume,
+  };
+}
+
+function loadMap(): ThreadMap {
+  const map: ThreadMap = {};
+  for (const row of stmtAll.all() as any[]) {
+    map[row.threadId] = rowToEntry(row);
+  }
+  return map;
+}
+
+function saveEntry(threadId: string, entry: ThreadEntry): void {
+  stmtUpsert.run({
+    threadId,
+    sessionId: entry.sessionId,
+    cwd: entry.cwd,
+    model: entry.model,
+    createdAt: entry.createdAt,
+    started: entry.started ? 1 : 0,
+    lastBotMessageId: entry.lastBotMessageId ?? null,
+    isLocalResume: entry.isLocalResume ? 1 : 0,
+  });
+}
+
+function getOrCreate(map: ThreadMap, threadId: string, defaultCwd: string): ThreadEntry {
+  if (!map[threadId]) {
+    const row = stmtGet.get(threadId) as any;
+    if (row) {
+      map[threadId] = rowToEntry(row);
+    } else {
+      map[threadId] = {
+        sessionId: crypto.randomUUID(),
+        cwd: defaultCwd,
+        model: "opus",
+        createdAt: Date.now(),
+        started: false,
+      };
+      saveEntry(threadId, map[threadId]);
+    }
+  }
+  return map[threadId];
+}
+
+// --- Local Session Discovery ---
+
+const CLAUDE_HOME = path.join(process.env.HOME ?? "", ".claude");
+
+/**
+ * Patch session file so CC's /resume picker can discover it.
+ * CC 2.1.90+ filters out sessions with entrypoint:"sdk-cli" from the picker.
+ * Rewriting to "cli" makes bot sessions visible alongside interactive ones.
+ */
+function patchSessionEntrypoint(sessionId: string, cwd: string): void {
+  try {
+    const sanitized = cwd.replace(/[^a-zA-Z0-9]/g, "-");
+    const projectDir = path.join(CLAUDE_HOME, "projects", sanitized);
+    const sessionFile = path.join(projectDir, `${sessionId}.jsonl`);
+    if (!fs.existsSync(sessionFile)) return;
+    const content = fs.readFileSync(sessionFile, "utf8");
+    if (!content.includes('"entrypoint":"sdk-cli"')) return;
+    fs.writeFileSync(sessionFile, content.replaceAll('"entrypoint":"sdk-cli"', '"entrypoint":"cli"'));
+  } catch { /* best-effort */ }
+}
+
+type LocalSession = {
+  sessionId: string;
+  cwd: string;
+  pid?: number;
+  alive: boolean;
+  startedAt?: number;
+  mtime: number;
+  lastPrompt?: string;
+};
+
+function isProcessAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+function discoverLocalSessions(): LocalSession[] {
+  const sessions: LocalSession[] = [];
+
+  // Active sessions from PID files — these have reliable CWD
+  const sessionsDir = path.join(CLAUDE_HOME, "sessions");
+  if (fs.existsSync(sessionsDir)) {
+    for (const file of fs.readdirSync(sessionsDir)) {
+      if (!file.endsWith(".json")) continue;
+      try {
+        const data = JSON.parse(fs.readFileSync(path.join(sessionsDir, file), "utf8"));
+        const alive = isProcessAlive(data.pid);
+        // Skip stale PID files (process dead)
+        if (!alive) continue;
+        sessions.push({
+          sessionId: data.sessionId,
+          cwd: data.cwd,
+          pid: data.pid,
+          alive: true,
+          startedAt: data.startedAt,
+          mtime: data.startedAt ?? 0,
+        });
+      } catch { /* skip malformed */ }
+    }
+  }
+
+  // Also check history.jsonl for recent sessions + last prompt per session
+  const historyPath = path.join(CLAUDE_HOME, "history.jsonl");
+  const promptBySession = new Map<string, string>(); // sessionId → last prompt
+  if (fs.existsSync(historyPath)) {
+    const seen = new Set(sessions.map(s => s.sessionId));
+    try {
+      const lines = fs.readFileSync(historyPath, "utf8").trim().split("\n");
+      // Read last 50 lines to get enough prompt context
+      const recent = lines.slice(-50);
+      const bySession = new Map<string, { cwd: string; mtime: number }>();
+      for (const line of recent) {
+        try {
+          const entry = JSON.parse(line);
+          const cwd = entry.cwd || entry.project;
+          if (entry.sessionId) {
+            if (entry.display) {
+              promptBySession.set(entry.sessionId, entry.display);
+            }
+            if (cwd) {
+              bySession.set(entry.sessionId, {
+                cwd,
+                mtime: typeof entry.timestamp === "number" ? entry.timestamp : 0,
+              });
+            }
+          }
+        } catch { /* skip */ }
+      }
+      // Add top 5 unseen sessions
+      const candidates = [...bySession.entries()]
+        .filter(([sid]) => !seen.has(sid))
+        .sort((a, b) => b[1].mtime - a[1].mtime)
+        .slice(0, 5);
+      for (const [sid, info] of candidates) {
+        sessions.push({
+          sessionId: sid,
+          cwd: info.cwd,
+          alive: false,
+          mtime: info.mtime,
+          lastPrompt: promptBySession.get(sid),
+        });
+      }
+    } catch { /* skip */ }
+  }
+
+  // Attach lastPrompt to PID-discovered sessions too
+  for (const s of sessions) {
+    if (!s.lastPrompt && promptBySession.has(s.sessionId)) {
+      s.lastPrompt = promptBySession.get(s.sessionId);
+    }
+  }
+
+  // Sort: alive first, then by mtime descending
+  sessions.sort((a, b) => {
+    if (a.alive !== b.alive) return a.alive ? -1 : 1;
+    return b.mtime - a.mtime;
+  });
+
+  return sessions;
+}
+
+// --- Backend / Persona configuration ---
+
+/** Conversation backend: cc = Claude Code session; gemini|grok|agy = one-shot family. */
+const BACKEND = (process.env.BACKEND ?? "cc") as "cc" | "gemini" | "grok" | "agy";
+/** One-shot family: no CC session — persona + history embedded every turn (gemini pattern). */
+const IS_ONESHOT = BACKEND !== "cc";
+const PERSONA = process.env.PERSONA ?? "iris";
+const GEMINI_MODEL = process.env.GEMINI_MODEL ?? "gemini-2.5-pro";
+
+// PERSONA_PROMPT env var allows fully overriding the system prompt at launch.
+// When IS_ONESHOT, this is prepended before thread history in every request.
+const PERSONA_PROMPT_OVERRIDE = process.env.PERSONA_PROMPT ?? "";
+
+// 可使用本 bot 的 Discord 使用者 ID（逗號分隔）。2026-08-04 加。
+//
+// ⚠️ 必須區分「沒設定」與「設了但解析後為空」：
+//   未設定            → 全開（維持既有部署不壞）
+//   設成 "," 或 "  "  → 授權零人（fail closed）
+// 若兩者都當成空陣列處理，`ALLOWED_USER_IDS=","` 會變成全部放行——
+// 使用者以為設了白名單、門其實開著，比沒設更危險。
+// （這個情境是 fredchu 在 PR #1 review 裡實測過的，我第一版沒處理，被自驗抓到。）
+const ALLOWED_USER_IDS_CONFIGURED =
+  (process.env.ALLOWED_USER_IDS ?? "").trim().length > 0;
+const ALLOWED_USER_IDS = (process.env.ALLOWED_USER_IDS ?? "")
+  .split(",").map((s) => s.trim()).filter(Boolean);
+
+const SELINA_SOUL = [
+  "你是 Selina — Realpha 投研公司的首席策略官與經濟學家。",
+  "你的思維方式是「打水漂」：從表象挖掘 3-5 層深的因果鏈。",
+  "一階是新聞標題（禁止停在這裡），二階是行為反噬，三階是規則重寫，四/五階是系統相變。",
+  "你穿透名相，直擊實相。經濟數據是推演的物理錨點，不是裝飾。",
+  "你總是用繁體中文回答，語氣犀利但有溫度。",
+  "在 Discord 對話中，你是團隊的宏觀策略大腦，隨時準備做推演。",
+  "",
+  "FORMATTING: Discord does NOT render markdown tables. Never use markdown table syntax (| col | col |).",
+  "When comparing items, use bold label + slash-separated attributes on one line per item.",
+].join("\n");
+
+// Resolve the effective Gemini system prompt:
+// Priority: PERSONA_PROMPT env > selina soul (when persona=selina) > generic fallback
+function resolveGeminiSystemPrompt(): string {
+  if (PERSONA_PROMPT_OVERRIDE) return PERSONA_PROMPT_OVERRIDE;
+
+  // Custom system prompt file from environment (e.g. for AthenaBot personality)
+  if (process.env.SYSTEM_PROMPT_FILE) {
+    const promptPath = path.isAbsolute(process.env.SYSTEM_PROMPT_FILE)
+      ? process.env.SYSTEM_PROMPT_FILE
+      : path.join(import.meta.dirname, "..", process.env.SYSTEM_PROMPT_FILE);
+    if (fs.existsSync(promptPath)) {
+      console.log(`[discord-cc-bot] loading custom Gemini system prompt from: ${promptPath}`);
+      return fs.readFileSync(promptPath, "utf8");
+    }
+  }
+
+  if (PERSONA === "selina") return SELINA_SOUL;
+  return [
+    "You are a helpful AI assistant in a Discord conversation.",
+    "Reply naturally and concisely. Use Traditional Chinese (繁體中文) when appropriate.",
+    "FORMATTING: Discord does NOT render markdown tables. Never use markdown table syntax.",
+  ].join("\n");
+}
+
+const GEMINI_SYSTEM_PROMPT = resolveGeminiSystemPrompt();
+
+if (IS_ONESHOT) {
+  const modelHint =
+    BACKEND === "gemini" ? GEMINI_MODEL : BACKEND === "grok" ? GROK_MODEL : "agy";
+  console.log(`[discord-cc-bot] backend=${BACKEND} persona=${PERSONA} oneshot model=${modelHint}`);
+}
+
+// --- Thread History ---
+
+let SYSTEM_PROMPT = [
+  "You are a Discord bot running inside a thread.",
+  "Multiple users may be talking in the same thread.",
+  "When thread history is provided, use it as context to understand the conversation so far.",
+  "Reply naturally as a participant in the group conversation.",
+  "IMPORTANT: Do NOT output any session handoff summaries, session recaps, bullet-point preambles, or any meta-commentary about previous sessions at the start of your reply.",
+  "Respond directly and immediately to the user's message.",
+  "",
+  "FORMATTING: Discord does NOT render markdown tables. Never use markdown table syntax (| col | col |).",
+  "When comparing items, use bold label + slash-separated attributes on one line per item, e.g.:",
+  "**Opus** — Speed: Slow / Quality: Best / Price: $$$",
+  "**Sonnet** — Speed: Fast / Quality: Good / Price: $$",
+  "**Haiku** — Speed: Fastest / Quality: OK / Price: $",
+  "",
+  // 2026-08-25 每日情報回流 B3（DESIGN_v1.1）：提到持股時帶當日情報卡＋寫消費帳本
+  "持股情報卡：使用者訊息提到持股代號（以 D:/ai-memory/data/portfolio_snapshot.json 的 holdings[].ticker 為準）時，",
+  "先讀 D:/ai-memory/research/companies/{TICKER}/intel/latest.md（不存在就略過不提）。",
+  "回答帶入卡片相關要點並標 as-of 日期；as-of 非今日要明說。",
+  "讀了卡片就用 Bash append 一行 JSON 到 D:/ai-memory/research/intel_ledger/consumption.jsonl：",
+  '{"ts":"<ISO時間>","consumer":"irisbot","ticker":"<代號>","card_asof":"<卡片as-of>"}（失敗不影響回答）。',
+  "沒讀卡就不要寫帳本——帳本是量測不是裝飾。",
+].join("\n");
+
+if (process.env.SYSTEM_PROMPT_FILE) {
+  const promptPath = path.isAbsolute(process.env.SYSTEM_PROMPT_FILE)
+    ? process.env.SYSTEM_PROMPT_FILE
+    : path.join(import.meta.dirname, "..", process.env.SYSTEM_PROMPT_FILE);
+  if (fs.existsSync(promptPath)) {
+    console.log(`[discord-cc-bot] loading custom system prompt from: ${promptPath}`);
+    SYSTEM_PROMPT = fs.readFileSync(promptPath, "utf8");
+  } else {
+    console.warn(`[discord-cc-bot] SYSTEM_PROMPT_FILE set but not found: ${promptPath}`);
+  }
+}
+
+// Persona enrichment: load ~/.agents/{PERSONA}/soul.md and prepend for Claude Code path.
+// Skip only pure BACKEND=gemini (chat uses GEMINI_SYSTEM_PROMPT). When BACKEND=grok|agy,
+// chat is oneshot (GEMINI_SYSTEM_PROMPT) but slash still uses CC → keep soul on SYSTEM_PROMPT.
+if (BACKEND !== "gemini" && (PERSONA === "iris" || PERSONA === "athena" || PERSONA === "selina")) {
+  try {
+    const soulPath = path.join(os.homedir(), ".agents", PERSONA, "soul.md");
+    if (fs.existsSync(soulPath)) {
+      const soul = fs.readFileSync(soulPath, "utf8");
+      SYSTEM_PROMPT = soul + "\n\n---\n\n# Discord Bot 行為指引\n\n" + SYSTEM_PROMPT;
+      console.log(`[discord-cc-bot] prepended ${PERSONA} soul to SYSTEM_PROMPT (soul=${soul.length} chars, total=${SYSTEM_PROMPT.length} chars)`);
+    } else {
+      console.warn(`[discord-cc-bot] ${PERSONA} soul not found at ${soulPath}`);
+    }
+  } catch (e) {
+    console.warn(`[discord-cc-bot] failed to load ${PERSONA} soul:`, e);
+  }
+}
+
+const RESUME_SYSTEM_PROMPT = [
+  "User is continuing this conversation from Discord (mobile).",
+  "This is the same session, just a different interface — respond normally.",
+  "IMPORTANT: Do NOT output any session handoff summaries, session recaps, bullet-point preambles, or any meta-commentary about previous sessions at the start of your reply.",
+  "Respond directly and immediately to the user's message.",
+  "",
+  "FORMATTING: Discord does NOT render markdown tables. Never use markdown table syntax (| col | col |).",
+  "When comparing items, use bold label + slash-separated attributes on one line per item, e.g.:",
+  "**Opus** — Speed: Slow / Quality: Best / Price: $$$",
+  "**Sonnet** — Speed: Fast / Quality: Good / Price: $$",
+  "**Haiku** — Speed: Fastest / Quality: OK / Price: $",
+].join("\n");
+
+const HISTORY_FETCH_LIMIT = 30;
+
+async function fetchThreadHistory(
+  channel: Message["channel"],
+  entry: ThreadEntry,
+  botUserId: string,
+  isGemini: boolean,
+  currentMessageId?: string,
+): Promise<string> {
+  const fetchOpts: { limit: number; after?: string } = { limit: HISTORY_FETCH_LIMIT };
+  if (entry.started && entry.lastBotMessageId && !isGemini) {
+    fetchOpts.after = entry.lastBotMessageId;
+  }
+
+  let messages: Collection<Snowflake, Message>;
+  try {
+    messages = await channel.messages.fetch(fetchOpts);
+  } catch {
+    return "";
+  }
+
+  if (messages.size === 0) return "";
+
+  const sorted = [...messages.values()]
+    .sort((a, b) => a.createdTimestamp - b.createdTimestamp)
+    .filter((m) => (isGemini || m.author.id !== botUserId) && m.id !== currentMessageId);
+
+  if (sorted.length === 0) return "";
+
+  const lines = sorted.map((m) => {
+    const name = m.member?.displayName ?? m.author.displayName ?? m.author.username;
+    const text = m.content.replace(/<@!?\d+>/g, "").trim();
+    return text ? `[${name}] ${text}` : null;
+  }).filter(Boolean);
+
+  if (lines.length === 0) return "";
+
+  const label = entry.started
+    ? "Messages from other users since your last reply"
+    : "Recent thread history for context";
+
+  return `[${label}]\n${lines.join("\n")}\n[End]\n\n`;
+}
+
+// --- Streaming Runner ---
+
+const running = new Map<string, ChildProcess>();
+
+type StreamCallbacks = {
+  onText?: (fullText: string) => void;
+  onToolUse?: (toolName: string) => void;
+};
+
+type AskQuestion = {
+  question: string;
+  header: string;
+  options: { label: string; description: string }[];
+  multiSelect: boolean;
+};
+
+type PermissionDenial = {
+  tool_name: string;
+  tool_use_id: string;
+  tool_input: { questions: AskQuestion[] };
+};
+
+type RunResult = { text: string; exitCode: number; costUsd?: number; permissionDenials?: PermissionDenial[] };
+
+/**
+ * Detects a !opus or !sonnet token at the start of a prompt.
+ * If found, strips the token and overrides the model for this message only.
+ * Does NOT update thread state — override is ephemeral (single-message).
+ *
+ * @param prompt       - Original user prompt
+ * @param defaultModel - Thread's current model (from SQLite)
+ * @returns { prompt, model, hint } where hint is non-null only when an override occurred
+ *          AND the resolved model differs from defaultModel.
+ */
+function applyModelOverride(
+  prompt: string,
+  defaultModel: string,
+  threadId?: string,
+): { prompt: string; model: string; hint: string | null; overridden: boolean; overrideToken?: string; emptyPrompt?: boolean } {
+  const trimmed = prompt.trimStart();
+  // Match !opus or !sonnet as first token (case-insensitive), followed by whitespace or end-of-string
+  const match = trimmed.match(/^!(opus|sonnet)(\s+|$)/i);
+  if (!match) {
+    return { prompt, model: defaultModel, hint: null, overridden: false };
+  }
+
+  const tokenLower = match[1].toLowerCase() as "opus" | "sonnet";
+  // Map short name to full model identifier expected by --model flag
+  const modelMap: Record<string, string> = {
+    opus: "opus",
+    sonnet: "sonnet",
+  };
+  const resolvedModel = modelMap[tokenLower];
+
+  // Strip the token (and trailing whitespace) from the prompt
+  const strippedToken = match[0]; // the full matched prefix including trailing whitespace
+  const strippedPrompt = trimmed.slice(strippedToken.length);
+
+  // Empty prompt after stripping token — signal caller to reject with guidance
+  if (!strippedPrompt.trim()) {
+    return {
+      prompt: strippedPrompt,
+      model: resolvedModel,
+      hint: null,
+      overridden: true,
+      overrideToken: `!${tokenLower}`,
+      emptyPrompt: true,
+    };
+  }
+
+  // Console log for debug (spec §5)
+  console.log(
+    `[model-override] thread=${threadId ?? "unknown"} default=${defaultModel} → override=${tokenLower} tokens_stripped="${strippedToken.trimEnd()}"`,
+  );
+
+  // Build Discord blockquote hint (spec format)
+  const hintEmoji = tokenLower === "opus" ? "🧠" : "⚡";
+  const hintLabel = tokenLower === "opus" ? "Opus" : "Sonnet";
+  const hint = `> ${hintEmoji} _!${tokenLower} 已生效 · 此條走 ${hintLabel} · 下條自動回原模型_`;
+
+  return {
+    prompt: strippedPrompt,
+    model: resolvedModel,
+    hint,
+    overridden: true,
+    overrideToken: `!${tokenLower}`,
+  };
+}
+
+function runClaudeStreamingOnce(opts: {
+  sessionId: string;
+  prompt: string;
+  cwd: string;
+  model: string;
+  claudeBin: string;
+  resume: boolean;
+  systemPrompt?: string;
+  timeoutMs?: number;
+  callbacks?: StreamCallbacks;
+  configDir?: string;   // 設了 → CLAUDE_CONFIG_DIR 隔離(乾淨腦,不載 Iris CLAUDE.md/hooks)
+}): Promise<RunResult> {
+  return new Promise((resolve, reject) => {
+    const args = PERSONA === "athena"
+      ? buildClaudeSpawnArgs({
+          prompt: opts.prompt,
+          sessionId: opts.sessionId,
+          model: opts.model,
+          resume: opts.resume,
+          systemPrompt: opts.systemPrompt,
+        }, execPolicy)
+      : [
+      "-p", opts.prompt,
+      ...(opts.resume ? ["--resume", opts.sessionId] : ["--session-id", opts.sessionId]),
+      "--model", opts.model,
+      "--dangerously-skip-permissions",
+      "--output-format", "stream-json",
+      "--verbose",
+      "--include-partial-messages",
+      ...(opts.systemPrompt ? ["--system-prompt", opts.systemPrompt] : []),
+    ];
+
+    // On Windows, .js/.mjs files can't be spawned directly — use node to execute them
+    const isJsFile = opts.claudeBin.endsWith(".js") || opts.claudeBin.endsWith(".mjs");
+    const spawnCmd = isJsFile ? process.execPath : opts.claudeBin;
+    const spawnArgs = isJsFile ? [opts.claudeBin, ...args] : args;
+
+    const child = spawn(spawnCmd, spawnArgs, {
+      cwd: opts.cwd,
+      env: { ...process.env, CLAUDECODE: undefined, ...(opts.configDir ? { CLAUDE_CONFIG_DIR: opts.configDir } : {}) },
+      stdio: ["ignore", "pipe", "pipe"],
+      shell: process.platform === "win32" && opts.claudeBin.endsWith(".cmd"),
+    });
+
+    running.set(opts.sessionId, child);
+
+    let buffer = "";
+    let stderrBuf = "";
+    let lastSeenText = "";
+    let resultText = "";
+    let costUsd: number | undefined;
+    let permissionDenials: PermissionDenial[] | undefined;
+    let settled = false;
+
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderrBuf += chunk.toString();
+    });
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      buffer += chunk.toString();
+      const lines = buffer.split("\n");
+      buffer = lines.pop()!;
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const event = JSON.parse(line);
+
+          if (event.type === "assistant" && event.message?.content) {
+            let messageText = "";
+            for (const block of event.message.content) {
+              if (block.type === "text") {
+                messageText += block.text || "";
+              } else if (block.type === "tool_use" && block.name) {
+                opts.callbacks?.onToolUse?.(block.name);
+              }
+            }
+            if (messageText && messageText !== lastSeenText) {
+              lastSeenText = messageText;
+              opts.callbacks?.onText?.(messageText);
+            }
+          }
+
+          if (event.type === "result") {
+            resultText = event.result || "";
+            costUsd = event.total_cost_usd;
+            if (event.permission_denials?.length > 0) {
+              permissionDenials = event.permission_denials;
+            }
+          }
+        } catch {
+          // Not valid JSON, skip
+        }
+      }
+    });
+
+    const timeout = opts.timeoutMs ?? 5_400_000;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      running.delete(opts.sessionId);
+      child.kill("SIGTERM");
+      const partial = resultText || lastSeenText || "";
+      if (partial) {
+        resolve({
+          text: partial + "\n\n⚠️ *Task timed out after 90 min — partial result above.*",
+          exitCode: 124,
+          costUsd,
+        });
+      } else {
+        reject(new Error(`Timeout after ${timeout}ms with no output`));
+      }
+    }, timeout);
+
+    child.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      running.delete(opts.sessionId);
+      reject(err);
+    });
+
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      running.delete(opts.sessionId);
+      const errHint = stderrBuf.trim() ? `\n\n⚠️ stderr: ${stderrBuf.trim().slice(0, 500)}` : "";
+      const text = resultText || lastSeenText || `(no output)${errHint}`;
+      resolve({ text, exitCode: code ?? 1, costUsd, permissionDenials });
+    });
+  });
+}
+
+// Transient claude-CLI backend blips: a dropped socket during the TLS/auth handshake
+// (concurrent OAuth-refresh race across multiple bots, network reset) gets mislabelled
+// "401 Failed to authenticate". The CLI has no internal retry, so one blip otherwise
+// surfaces a raw error to the user. Mirror the Gemini path's retry with a short backoff.
+const CLAUDE_TRANSIENT_RE =
+  /Failed to authenticate|API Error: 401|socket connection was closed|ECONNRESET|fetch failed|Connection error/i;
+
+// True iff the OAuth accessToken exists and is not expiring within `marginMs`.
+function credAccessTokenValid(credsPath: string, marginMs = 10 * 60_000): boolean {
+  try {
+    const o = JSON.parse(fs.readFileSync(credsPath, "utf8"))?.claudeAiOauth;
+    if (!o?.accessToken) return false;
+    const exp = Number(o.expiresAt);
+    return Number.isFinite(exp) && exp > Date.now() + marginMs;
+  } catch {
+    return false; // missing / unparseable
+  }
+}
+
+// Auto-heal isolated-config auth by treating the isolated CLAUDE_CONFIG_DIR as a stateless
+// consumer of the main account's token. Two failure modes are covered:
+//   1. A socket drop mid token-refresh leaves the isolated .credentials.json with no
+//      accessToken → permanent "OAuth session expired".
+//   2. Separate credential files share ONE rotating refresh token: once main refreshes, the
+//      isolated copy's refresh token is invalidated, its next spawn's refresh fails, and
+//      claude then wipes the isolated creds → a self-perpetuating loop.
+// Fix: before every isolated spawn, if the isolated accessToken is missing or (near-)expired,
+// overwrite it from main's CURRENT creds. Main is the actively-used config and stays fresh,
+// so the isolated spawn always gets a still-valid accessToken and never needs to refresh —
+// which means it never touches (rotates) the shared refresh token. That breaks the loop.
+function ensureIsolatedCreds(configDir: string): void {
+  try {
+    const mainCreds = path.join(CLAUDE_HOME, ".credentials.json");
+    const isoCreds = path.join(configDir, ".credentials.json");
+    if (path.resolve(isoCreds) === path.resolve(mainCreds)) return;
+    if (credAccessTokenValid(isoCreds)) return; // isolated still has a fresh token
+    if (!credAccessTokenValid(mainCreds)) return; // main not usable — a main-level problem
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.copyFileSync(mainCreds, isoCreds);
+    console.error(`[creds-heal] reseeded isolated ${configDir} from main (fresh token)`);
+  } catch (e) {
+    console.error(`[creds-heal] failed for ${configDir}: ${(e as Error).message}`);
+  }
+}
+
+async function runClaudeStreaming(
+  opts: Parameters<typeof runClaudeStreamingOnce>[0],
+): Promise<RunResult> {
+  const maxRetries = Number(process.env.CLAUDE_MAX_RETRIES ?? 2);
+  let effectiveOpts = opts;
+  let result: RunResult = { text: "(no output)", exitCode: 1 };
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    // Reseed before EVERY attempt, not just the first: a failed spawn can wipe the isolated
+    // creds (accessToken:"" / expiresAt:0) mid-flight, and a once-only pre-loop heal then
+    // leaves both retries spending the same dead file. 2026-09-18: three Fred intake
+    // summaries failed this exact way while main creds were valid the whole time.
+    if (opts.configDir) ensureIsolatedCreds(opts.configDir);
+    result = await runClaudeStreamingOnce(effectiveOpts);
+
+    // Session-id collision self-heal: a prior failed attempt (e.g. a 401) can leave the
+    // session .jsonl on disk while the caller still treats the session as fresh (passes
+    // --session-id because its `started` flag was never advanced past the failure).
+    // "Session ID … is already in use" then means the session exists — resume it instead
+    // of trying to recreate it. One-shot flip, not counted against the transient retries.
+    if (
+      !effectiveOpts.resume &&
+      /Session ID .* is already in use/i.test(result.text)
+    ) {
+      console.error(
+        `[claude-session] ${effectiveOpts.sessionId} already exists — retrying as --resume`,
+      );
+      effectiveOpts = { ...effectiveOpts, resume: true };
+      result = await runClaudeStreamingOnce(effectiveOpts);
+    }
+
+    // Treat as transient only when the whole (short) output is the error — a real answer
+    // that merely mentions "401" is long and won't start with the CLI error string.
+    const looksTransient =
+      CLAUDE_TRANSIENT_RE.test(result.text) && result.text.length < 600;
+    if (!looksTransient) return result;
+    if (attempt < maxRetries) {
+      const waitMs = 2500 * (attempt + 1);
+      console.error(
+        `[claude-retry] transient backend failure (attempt ${attempt + 1}/${maxRetries + 1}), retry in ${waitMs}ms: ${result.text.slice(0, 120)}`,
+      );
+      await new Promise((r) => setTimeout(r, waitMs));
+    }
+  }
+  // Exhausted retries — replace the raw CLI error with a friendly note.
+  return {
+    ...result,
+    text: `⚠️ 後端連線暫時中斷（已自動重試 ${maxRetries} 次仍失敗），請稍後再試一次。`,
+  };
+}
+
+// --- Gemini Streaming Runner ---
+
+/**
+ * Build the full prompt that is sent to the Gemini CLI.
+ * Structure:
+ *   [System: <soul>]
+ *
+ *   [Thread History]
+ *   [user]: msg
+ *   ...
+ *
+ *   [Current Message]
+ *   [username]: latest message
+ */
+function buildGeminiPrompt(opts: {
+  systemPrompt: string;
+  history: string;      // pre-formatted history block (may be empty)
+  username: string;
+  userMessage: string;
+}): string {
+  const parts: string[] = [];
+
+  parts.push(`[System: ${opts.systemPrompt}]`);
+
+  if (opts.history.trim()) {
+    parts.push(opts.history.trim());
+  }
+
+  parts.push(`[Current Message]\n[${opts.username}]: ${opts.userMessage}`);
+
+  return parts.join("\n\n");
+}
+
+async function runGeminiStreaming(opts: {
+  prompt: string;
+  model: string;
+  timeoutMs?: number;
+  callbacks?: StreamCallbacks;
+}): Promise<RunResult> {
+  // --- Retry + fallback wrapper ---
+  const maxRetries = Number(process.env.GEMINI_MAX_RETRIES ?? 2);
+  const fallbackModel = process.env.GEMINI_FALLBACK_MODEL ?? "gemini-2.5-pro";
+  const baseTimeout = opts.timeoutMs ?? Number(process.env.GEMINI_TIMEOUT_MS ?? 300_000);
+
+  const models: string[] = [opts.model];
+  if (fallbackModel && fallbackModel !== opts.model) models.push(fallbackModel);
+
+  let lastErrText = "";
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    // Primary model for first (maxRetries) attempts, fallback model on final attempt
+    const useFallback = attempt === maxRetries && models.length > 1;
+    const model = useFallback ? models[1] : models[0];
+    const label = useFallback ? `fallback=${model}` : `model=${model} attempt=${attempt + 1}/${maxRetries + 1}`;
+    console.log(`[gemini] ${label}`);
+
+    try {
+      const result = await runGeminiOnce({ ...opts, model, timeoutMs: baseTimeout });
+      // Clean success
+      if (result.exitCode === 0 && result.text && !result.text.startsWith("⚠️")) {
+        if (useFallback) {
+          return { ...result, text: `_（備援模型 ${model} 回應）_\n\n${result.text}` };
+        }
+        return result;
+      }
+      // Timeout but with partial streamed content — don't retry (user saw it)
+      if (result.exitCode === 124 && !result.text.startsWith("⚠️")) {
+        return result;
+      }
+      lastErrText = result.text || "(empty response)";
+    } catch (err) {
+      lastErrText = (err as Error).message ?? String(err);
+      console.error(`[gemini] attempt ${attempt + 1} threw:`, lastErrText);
+    }
+
+    // Backoff before next attempt (skip after last)
+    if (attempt < maxRetries) {
+      const backoffMs = 3000 * (attempt + 1);
+      console.log(`[gemini] backing off ${backoffMs}ms before retry`);
+      await new Promise((r) => setTimeout(r, backoffMs));
+    }
+  }
+
+  return {
+    text: `⚠️ Gemini 逾時或無回應（已重試 ${maxRetries} 次 + 備援模型 ${fallbackModel}，逾時 ${Math.round(baseTimeout / 1000)}s）。\n原訊息已保留，請 @ 我重試，或稍後再試。`,
+    exitCode: 124,
+  };
+}
+
+function runGeminiOnce(opts: {
+  prompt: string;
+  model: string;
+  timeoutMs?: number;
+  callbacks?: StreamCallbacks;
+}): Promise<RunResult> {
+  return new Promise((resolve, reject) => {
+    // gemini.cmd CLI 已停（Google 2026-06-18）；改走 gemini_call.py（google-genai SDK，
+    // 內建 3.5-flash→2.5-flash fallback）。不傳 --model：pin 單一 model(如 3.1-pro)會 429 hard-fail，
+    // 留空才走 SDK 的 fallback 鏈。完整 prompt 經 stdin 餵入（避開 Windows ARG 長度限制）。
+    const py = process.env.PYTHON_BIN ?? "python";
+    const geminiCallPy = path.join(os.homedir(), "scripts", "gemini_call.py");
+    const timeoutSec = Math.round((opts.timeoutMs ?? 300_000) / 1000);
+    const child = spawn(py, [geminiCallPy, "依下列內容回應，直接輸出最終回覆，勿加前言", "--timeout", String(timeoutSec)], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    child.stdin.write(opts.prompt);
+    child.stdin.end();
+
+    let stderrBuf = "";
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderrBuf += chunk.toString();
+      console.error(`[gemini-stderr] ${chunk.toString().trim()}`);
+    });
+
+    let stdout = "";
+    let settled = false;
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      const text = chunk.toString();
+      stdout += text;
+      opts.callbacks?.onText?.(stdout);
+    });
+
+    const timeout = opts.timeoutMs ?? 300_000;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { child.kill("SIGTERM"); } catch {}
+      // Force kill after 5s if SIGTERM doesn't work (Windows)
+      setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 5000);
+      const partial = stdout.trim();
+      if (partial) {
+        resolve({
+          text: partial + "\n\n⚠️ *Gemini timed out — partial result above.*",
+          exitCode: 124,
+        });
+      } else {
+        resolve({
+          text: "⚠️ Gemini 目前沒有回應，請稍後再試。",
+          exitCode: 124,
+        });
+      }
+    }, timeout);
+
+    child.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
+    });
+
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const text = stdout.trim() || "(no output from Gemini)";
+      resolve({ text, exitCode: code ?? 1 });
+    });
+  });
+}
+
+/**
+ * One-shot family dispatcher (gemini | grok | agy).
+ * Persona + history already embedded in prompt via buildGeminiPrompt.
+ */
+async function runOneshotStreaming(opts: {
+  prompt: string;
+  model?: string;
+  timeoutMs?: number;
+  callbacks?: StreamCallbacks;
+}): Promise<RunResult> {
+  const timeoutMs = opts.timeoutMs ?? Number(process.env.GEMINI_TIMEOUT_MS ?? 300_000);
+  if (BACKEND === "gemini") {
+    return runGeminiStreaming({
+      prompt: opts.prompt,
+      model: opts.model ?? GEMINI_MODEL,
+      timeoutMs,
+      callbacks: opts.callbacks,
+    });
+  }
+  if (BACKEND === "grok") {
+    return runGrokOnce({
+      prompt: opts.prompt,
+      timeoutMs,
+      callbacks: opts.callbacks,
+    });
+  }
+  if (BACKEND === "agy") {
+    if (PERSONA === "selina") {
+      return runResilientOneshot({
+        prompt: opts.prompt,
+        timeoutMs,
+        primaryBackend: "agy",
+        callbacks: opts.callbacks,
+      });
+    }
+    return runAgyOnce({
+      prompt: opts.prompt,
+      timeoutMs,
+      callbacks: opts.callbacks,
+    });
+  }
+  throw new Error(`runOneshotStreaming called with BACKEND=${BACKEND}`);
+}
+
+/** Engine disclosure line for reply prefix (cc first-reply only; oneshot every reply for grok/agy). */
+function buildBackendDisclosure(opts?: {
+  isFirstReply?: boolean;
+  isLocalResume?: boolean;
+}): string {
+  // 版號一律從實際呼叫用的 GROK_MODEL 取，避免顯示與實際脫鉤（2026-08-16 曾寫死 4.6 但實打 4.5）
+  if (BACKEND === "grok") {
+    return `*Grok ${GROK_MODEL.replace(/^grok-/, "")} (xAI) 回覆*\n\n`;
+  }
+  if (BACKEND === "agy") return "*agy (Gemini) 回覆*\n\n";
+  if (BACKEND === "gemini") return "";
+  // cc — match historical first-reply disclosure
+  if (opts?.isFirstReply !== false && !opts?.isLocalResume) {
+    return "*I'm Claude, an AI assistant by Anthropic.*\n\n";
+  }
+  return "";
+}
+
+// --- AskUserQuestion button rendering ---
+
+async function sendAskButtons(
+  channel: { send: (opts: any) => Promise<Message> },
+  threadId: string,
+  entry: ThreadEntry,
+  denial: PermissionDenial,
+): Promise<void> {
+  for (const q of denial.tool_input.questions) {
+    const row = new ActionRowBuilder<ButtonBuilder>();
+    for (const opt of q.options.slice(0, 4)) {
+      row.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`ask_${entry.sessionId}_${opt.label}`.slice(0, 100))
+          .setLabel(opt.label)
+          .setStyle(ButtonStyle.Primary),
+      );
+    }
+    if (q.options.length <= 3) {
+      row.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`ask_${entry.sessionId}_OTHER`)
+          .setLabel("Other...")
+          .setStyle(ButtonStyle.Secondary),
+      );
+    }
+    const botReply = await channel.send({
+      content: `❓ **${q.question}**`,
+      components: [row],
+    });
+    entry.lastBotMessageId = botReply.id;
+  }
+  saveEntry(threadId, entry);
+}
+
+// --- Streaming tool-use callback ---
+
+function createToolUseHandler(ps: PreviewState): (toolName: string) => void {
+  return (toolName) => {
+    console.log(`[discord-cc-bot] tool: ${toolName}`);
+    ps.toolsUsed.push(toolName);
+    if (ps.msg) {
+      const text = (ps.pendingText || "").slice(0, PREVIEW_MAX_LEN);
+      ps.msg.edit(text + buildStatusLine(ps)).catch(() => {});
+    }
+  };
+}
+
+// --- Attachment handling ---
+
+const ATTACH_TMP_DIR = path.join(import.meta.dirname, "..", "tmp-attachments");
+const ATTACH_MAX_BYTES = 10 * 1024 * 1024; // 10 MB per file
+
+async function downloadAttachment(url: string, filepath: string): Promise<void> {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Failed to download: ${res.status}`);
+  const buf = Buffer.from(await res.arrayBuffer());
+  fs.mkdirSync(path.dirname(filepath), { recursive: true });
+  fs.writeFileSync(filepath, buf);
+}
+
+// --- 語音訊息 → 轉錄稿（2026-08-03）---------------------------------------
+// 為什麼要有這段：Discord 語音訊息本質是帶 IsVoiceMessage(8192) flag 的 .ogg 附件。
+// 原本流程只把附件路徑塞進 prompt 讓 agent 用 Read tool 讀，但 Read 讀不了音檔 →
+// 語音進來等於石沉大海。改成先轉錄，把「話的內容」變成 prompt 的一部分，
+// 才能達成「講一段話 → agent 當任務執行」。
+// 轉錄走既有 ~/scripts/tongyi/transcribe_file.py（重用 tongyi 的防幻覺 whisper 設定：
+// vad_filter / condition_on_previous_text=false / 刻意不給 initial_prompt）。
+// ⚠️ whisper large-v3 輸出為簡體，轉錄稿僅供 agent 讀，不可直接顯示給 Charles。
+const DISCORD_FLAG_IS_VOICE_MESSAGE = 8192;
+const TRANSCRIBE_PY = path.join(os.homedir(), "scripts", "tongyi", "transcribe_file.py");
+
+function isVoiceMessage(message: any): boolean {
+  const bits = message?.flags?.bitfield ?? message?.flags ?? 0;
+  return (Number(bits) & DISCORD_FLAG_IS_VOICE_MESSAGE) !== 0;
+}
+
+function convertToMarkdown(filepath: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(
+      "python",
+      [FILE_TO_MD_PY, filepath],
+      {
+        timeout: FILE_TO_MD_TIMEOUT_MS,
+        windowsHide: true,
+        encoding: "utf8",
+        maxBuffer: 2 * 1024 * 1024,
+        env: { ...process.env, PYTHONUTF8: "1" },
+      },
+      (err, stdout, stderr) => {
+        const body = (stdout ?? "").trim();
+        if (!body) {
+          if (stderr?.trim() || err) {
+            console.error(`[discord-cc-bot] file_to_md failed:`, stderr?.trim() || err);
+          }
+          resolve(
+            "kind: doc-markdown\nstatus: CONVERT_FAILED\nnote: 轉換沒輸出\nrule: 禁止假裝已讀原檔。",
+          );
+          return;
+        }
+        resolve(body);
+      },
+    );
+  });
+}
+
+function transcribeVoice(filepath: string): Promise<{ ok: boolean; text: string; note: string }> {
+  return new Promise((resolve) => {
+    const py = process.env.PYTHON_BIN ?? "python";
+    execFile(py, [TRANSCRIBE_PY, filepath],
+      { timeout: 300_000, env: { ...process.env, PYTHONUTF8: "1" }, maxBuffer: 8 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        const text = (stdout || "").trim();
+        if (err || !text) {
+          resolve({ ok: false, text: "", note: (stderr || err?.message || "轉錄無輸出").toString().slice(0, 200) });
+          return;
+        }
+        // stderr 帶時長/語言/幻覺警告，保留給 log 與使用者提示（fail loud）
+        resolve({ ok: true, text, note: (stderr || "").toString().trim().slice(0, 200) });
+      });
+  });
+}
+
+// 2026-08-04：語音訊息 → 直接拿到逐字稿（下載＋轉錄＋清暫存一次做完）。
+// 給「收料檔案問答」那條路徑用——它不走 MessageCreate 的附件下載流程，
+// 原本收到語音只會回「@我 後面直接打問題就好」（實測 15:12）。
+// 這是本檔第三條會碰到語音的路徑，前兩條在 MessageCreate 裡。
+async function transcribeVoiceAttachment(message: any): Promise<{ ok: boolean; text: string; note: string }> {
+  const att = [...message.attachments.values()][0] as any;
+  if (!att) return { ok: false, text: "", note: "語音訊息沒有附件" };
+  const ext = att.name?.split(".").pop() ?? "ogg";
+  const fp = path.join(ATTACH_TMP_DIR, `${message.id}_${att.id}.${ext}`);
+  try {
+    await downloadAttachment(att.url, fp);
+    return await transcribeVoice(fp);
+  } catch (err) {
+    return { ok: false, text: "", note: (err as Error).message.slice(0, 200) };
+  } finally {
+    fs.unlink(fp, () => {});
+  }
+}
+
+// --- 收料頻道：Fred 分享即時入庫（佐助前門，確定性轉換，零 LLM，僅 IrisBot）---
+const INTAKE_CHANNEL_NAME = process.env.INTAKE_CHANNEL_NAME ?? "收料";
+const INTAKE_CHANNEL_ID = process.env.INTAKE_CHANNEL_ID ?? "1528300306616684645"; // #收料 文字頻道(開檔案 thread 用)
+const INTAKE_MAX_BYTES = 50 * 1024 * 1024; // 50 MB
+const FRED_INTAKE_PY = path.join(os.homedir(), "scripts", "data_readiness", "fred_intake.py");
+// 檔案問答「乾淨腦」隔離：只複製認證、不含 Iris CLAUDE.md/hooks（見 D:/dev-cache/fred-qa-config）
+const FRED_QA_CONFIG = process.env.FRED_QA_CONFIG ?? "D:/dev-cache/fred-qa-config";
+const FRED_QA_CWD = process.env.FRED_QA_CWD ?? "D:/Temp/claude/fred-qa-cwd";
+const FRED_QA_MAP = path.join(import.meta.dirname, "..", "fred_qa_threads.json"); // threadId -> {file, sessionId}
+const FRED_SHARED_DIR = "D:\\ai-memory\\knowledge\\fred-shared";
+const FRED_SUMMARIES_PATH = path.join(FRED_SHARED_DIR, "_summaries.jsonl");
+const FRED_HOLDINGS_PATH = "D:\\ai-memory\\data\\holdings.json";
+const FRED_WATCHLIST_PATH = "D:\\ai-memory\\data\\watchlist.json";
+const FRED_SUMMARY_PY = path.join(os.homedir(), "scripts", "data_readiness", "fred_intake_summary.py");
+
+type QaEntry = { file: string; sessionId: string; started?: boolean; guildId?: string };
+function loadQaMap(): Record<string, QaEntry> {
+  try { return JSON.parse(fs.readFileSync(FRED_QA_MAP, "utf-8")); } catch { return {}; }
+}
+function saveQaEntry(threadId: string, entry: QaEntry): void {
+  const m = loadQaMap();
+  m[threadId] = entry;
+  try { fs.writeFileSync(FRED_QA_MAP, JSON.stringify(m, null, 1)); } catch (e) { console.error("[fred-qa] map save fail", e); }
+}
+
+type IntakeResult = { status: string; title?: string; chars?: number; converter?: string; path?: string; note?: string };
+
+function runFredIntake(rawPath: string, sourceName: string): Promise<IntakeResult> {
+  return new Promise((resolve) => {
+    const py = process.env.PYTHON_BIN ?? "python";
+    // --source-name=<值> 等號形式：檔名開頭若是 '-'(如某些字幕檔) argparse 不會誤判成選項
+    execFile(py, [FRED_INTAKE_PY, rawPath, `--source-name=${sourceName}`],
+      { timeout: 120_000, env: { ...process.env, PYTHONUTF8: "1" }, maxBuffer: 8 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        const line = (stdout || "").trim().split("\n").filter(Boolean).pop() || "";
+        try {
+          resolve(JSON.parse(line) as IntakeResult);
+        } catch {
+          resolve({ status: "error", note: (stderr || (err && err.message) || "intake 無輸出").toString().slice(0, 200) });
+        }
+      });
+  });
+}
+
+function runQmdUpdate(): Promise<boolean> {
+  return new Promise((resolve) => {
+    execFile("qmd", ["update"], { timeout: 120_000, shell: true }, (err) => resolve(!err));
+  });
+}
+
+function loadTickerFile(filePath: string, keys: string[]): string[] {
+  try {
+    const data = JSON.parse(fs.readFileSync(filePath, "utf-8")) as Record<string, unknown>;
+    for (const key of keys) {
+      const value = data[key];
+      if (Array.isArray(value)) return value.filter((item): item is string => typeof item === "string");
+    }
+  } catch (err) {
+    console.warn(`[fred-summary] ticker file read failed: ${filePath}: ${(err as Error).message}`);
+  }
+  return [];
+}
+
+export function matchIntakeTickers(text: string, tickers: string[]): string[] {
+  const hits: string[] = [];
+  const seen = new Set<string>();
+  for (const rawTicker of tickers) {
+    const ticker = rawTicker.trim().toUpperCase();
+    if (!ticker || seen.has(ticker)) continue;
+    const pattern = new RegExp(`(?<![A-Za-z0-9])${ticker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![A-Za-z0-9])`, "i");
+    if (pattern.test(text)) {
+      hits.push(ticker);
+      seen.add(ticker);
+    }
+  }
+  return hits;
+}
+
+function trackedIntakeTickers(): string[] {
+  const holdings = loadTickerFile(FRED_HOLDINGS_PATH, ["holdings"]);
+  const watchlist = loadTickerFile(FRED_WATCHLIST_PATH, ["tickers", "watchlist"]);
+  return [...new Set([...holdings, ...watchlist].map(t => t.trim().toUpperCase()).filter(Boolean))];
+}
+
+function yamlQuote(value: string): string {
+  return JSON.stringify(value);
+}
+
+export function writeIntakeFrontmatter(mdPath: string, hits: string[], signal: string, summary: string): void {
+  const body = fs.readFileSync(mdPath, "utf-8");
+  const cleanSummary = summary.replace(/\r?\n/g, " ").trim();
+  const fields = [
+    `summary: ${yamlQuote(cleanSummary)}`,
+    `hits: ${JSON.stringify(hits)}`,
+    `signal: ${yamlQuote(signal)}`,
+  ];
+  const frontmatter = body.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
+  let updated: string;
+  if (frontmatter) {
+    const existingLines = frontmatter[1].split(/\r?\n/).filter(line => !/^\s*(summary|hits|signal):/.test(line));
+    updated = `---\n${[...existingLines, ...fields].join("\n")}\n---\n${body.slice(frontmatter[0].length)}`;
+  } else {
+    updated = `---\n${fields.join("\n")}\n---\n\n${body}`;
+  }
+  fs.writeFileSync(mdPath, updated, "utf-8");
+}
+
+function appendIntakeSummaryRecord(record: {
+  date: string;
+  path: string;
+  thread_id: string;
+  hits: string[];
+  signal: string;
+  summary: string;
+}): void {
+  fs.mkdirSync(path.dirname(FRED_SUMMARIES_PATH), { recursive: true });
+  fs.appendFileSync(FRED_SUMMARIES_PATH, `${JSON.stringify(record, null, 0)}\n`, "utf-8");
+}
+
+function taipeiDate(): string {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Taipei" }).format(new Date());
+}
+
+function stripSummaryLinePrefix(line: string): string {
+  return line.replace(/^\s*(?:[1-4][.)、:]?|[-*])\s*/, "").trim();
+}
+
+function normalizeIntakeSummary(raw: string, hits: string[]): { rendered: string; summary: string; signal: string } {
+  const lines = raw.replace(/```[\s\S]*?```/g, "").split(/\r?\n/).map(stripSummaryLinePrefix).filter(Boolean);
+  const first = (lines[0] || "這份材料未產生摘要").slice(0, 180);
+  const second = hits.length
+    ? `${hits.join("、")}：${(lines[1] || "模型未補充命中原因").slice(0, 180)}`
+    : "無";
+  const third = (lines[2] || "只是資料沒有立場").slice(0, 180);
+  const signal = (["碰到持股要決策", "值得看", "無關"] as const).find(item => lines[3]?.includes(item))
+    ?? (hits.length ? "碰到持股要決策" : "無關");
+  return {
+    rendered: [`1 ${first}`, `2 ${second}`, `3 ${third}`, `4 行動訊號：${signal}`].join("\n"),
+    summary: first,
+    signal,
+  };
+}
+
+function intakeSummaryPrompt(mdPath: string, hits: string[]): string {
+  const hitText = hits.length ? hits.join("、") : "無";
+  return `只讀這一份檔回答，繁體中文、禁簡體、不超過 180 字，嚴格只輸出四行，每行一句：
+1 這份在講什麼（一句）
+2 碰到哪些持股或觀察名單：${hitText}；只解釋為什麼碰到，沒有就寫「無」
+3 Fred 的立場或結論是什麼（一句，沒有就寫「只是資料沒有立場」）
+4 行動訊號：只能三選一「無關／值得看／碰到持股要決策」
+檔案路徑：${mdPath}`;
+}
+
+function runFredSummaryHelper(mdPath: string): Promise<string[] | null> {
+  return new Promise((resolve) => {
+    const py = process.env.PYTHON_BIN ?? "python";
+    execFile(py, [FRED_SUMMARY_PY, mdPath, "--hits"],
+      { timeout: 30_000, env: { ...process.env, PYTHONUTF8: "1" }, maxBuffer: 512 * 1024 },
+      (err, stdout) => {
+        if (err) { resolve(null); return; }
+        try {
+          const data = JSON.parse(stdout.trim()) as { hits?: unknown };
+          resolve(Array.isArray(data.hits) ? data.hits.filter((x): x is string => typeof x === "string") : null);
+        } catch { resolve(null); }
+      });
+  });
+}
+
+async function summarizeIntakeFile(mdPath: string, threadId: string, userId: string): Promise<void> {
+  const text = fs.readFileSync(mdPath, "utf-8");
+  const hits = (await runFredSummaryHelper(mdPath)) ?? matchIntakeTickers(text, trackedIntakeTickers());
+  let rendered: string;
+  let summary: string;
+  let signal: string;
+  try {
+    const result = await answerAboutFile(mdPath, intakeSummaryPrompt(mdPath, hits), crypto.randomUUID(), false);
+    if (result.exitCode !== 0) throw new Error((result.text || "模型回傳失敗").slice(0, 180));
+    ({ rendered, summary, signal } = normalizeIntakeSummary(result.text, hits));
+  } catch (err) {
+    const reason = ((err as Error).message || "未知原因").replace(/\r?\n/g, " ").slice(0, 120);
+    summary = `摘要暫時產不出來（${reason}），檔已入庫`;
+    signal = hits.length ? "碰到持股要決策" : "無關";
+    rendered = [`1 ${summary}`, `2 ${hits.length ? hits.join("、") : "無"}`, "3 只是資料沒有立場", `4 行動訊號：${signal}`].join("\n");
+    console.error(`[fred-summary] model failed for ${mdPath}: ${reason}`);
+  }
+
+  try {
+    writeIntakeFrontmatter(mdPath, hits, signal, summary);
+    appendIntakeSummaryRecord({ date: taipeiDate(), path: mdPath, thread_id: threadId, hits, signal, summary });
+  } catch (err) {
+    console.error(`[fred-summary] metadata write failed for ${mdPath}: ${(err as Error).message}`);
+  }
+
+  const post = `📌 入庫摘要\n${rendered}`;
+  try {
+    const thread = await client.channels.fetch(threadId);
+    if (thread && "send" in thread) {
+      for (const chunk of splitMessage(post)) await (thread as any).send(chunk);
+    }
+  } catch (err) {
+    console.error(`[fred-summary] thread post failed for ${mdPath}: ${(err as Error).message}`);
+  }
+  try {
+    const sent = await dmCharlesOnError(client, post, `Fred 入庫摘要（上傳者 ${userId}）`);
+    if (!sent) console.warn("[fred-summary] Charles DM skipped or failed");
+  } catch (err) {
+    console.error(`[fred-summary] Charles DM failed: ${(err as Error).message}`);
+  }
+}
+
+type IntakeQueryResult = {
+  date: string;
+  title: string;
+  summary: string;
+  link: string;
+  score: number;
+  filePath: string;
+};
+
+function qmdUriToLocalPath(uri: string): string {
+  let value = uri.replace(/^qmd:\/\//, "").replace(/\//g, path.sep);
+  const cVault = path.normalize("C:\\Users\\Charles\\ai-memory");
+  const dVault = path.normalize("D:\\ai-memory");
+  if (value.toLowerCase().startsWith(`${cVault.toLowerCase()}${path.sep}`)) {
+    value = dVault + value.slice(cVault.length);
+  }
+  return path.normalize(value);
+}
+
+function isFredSharedPath(filePath: string): boolean {
+  const relative = path.relative(path.resolve(FRED_SHARED_DIR), path.resolve(filePath));
+  return relative !== "" && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)
+    && relative.toLowerCase().endsWith(".md") && !relative.toLowerCase().startsWith(`_assets${path.sep}`);
+}
+
+function frontmatterValue(body: string, key: string): string | null {
+  const match = body.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
+  if (!match) return null;
+  const line = match[1].split(/\r?\n/).find(item => new RegExp(`^${key}:\\s*`).test(item));
+  if (!line) return null;
+  const raw = line.slice(line.indexOf(":") + 1).trim();
+  if (raw.startsWith('"')) {
+    try { return JSON.parse(raw) as string; } catch { return raw.replace(/^"|"$/g, ""); }
+  }
+  return raw;
+}
+
+function fileSummary(filePath: string): { title: string; summary: string; date: string } {
+  const body = fs.readFileSync(filePath, "utf-8");
+  const title = frontmatterValue(body, "title") || path.basename(filePath, path.extname(filePath));
+  const summary = frontmatterValue(body, "summary")
+    || body.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "").replace(/\s+/g, " ").trim().slice(0, 80)
+    || "（沒有摘要）";
+  const date = path.basename(filePath).match(/^(\d{4}-\d{2}-\d{2})_/)?.[1] ?? "未知日期";
+  return { title, summary: summary.split(/\r?\n/)[0].slice(0, 160), date };
+}
+
+function threadLinkForFile(filePath: string): string {
+  const normalized = path.normalize(filePath).toLowerCase();
+  const found = Object.entries(loadQaMap()).find(([, entry]) => path.normalize(entry.file).toLowerCase() === normalized);
+  if (!found) return filePath;
+  const guildId = found[1].guildId ?? process.env.GUILD_ID;
+  return guildId ? `https://discord.com/channels/${guildId}/${found[0]}` : filePath;
+}
+
+function parseQmdSearchOutput(stdout: string): Array<{ file?: string; score?: number }> {
+  const start = stdout.indexOf("[");
+  const end = stdout.lastIndexOf("]");
+  if (start < 0 || end <= start) return [];
+  try {
+    const parsed = JSON.parse(stdout.slice(start, end + 1)) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((item): item is { file?: string; score?: number } => typeof item === "object" && item !== null) : [];
+  } catch {
+    return [];
+  }
+}
+
+function runQmdSearch(keyword: string): Promise<Array<{ file?: string; score?: number }>> {
+  return new Promise((resolve) => {
+    execFile("qmd", ["search", keyword, "-n", "50", "--format", "json", "--full-path", "--no-rerank"],
+      { timeout: 30_000, maxBuffer: 8 * 1024 * 1024 },
+      (err, stdout) => resolve(err ? [] : parseQmdSearchOutput(stdout)));
+  });
+}
+
+async function searchIntakeFiles(keyword: string): Promise<IntakeQueryResult[]> {
+  const rows = await runQmdSearch(keyword);
+  const results: IntakeQueryResult[] = [];
+  const seen = new Set<string>();
+  for (const row of rows) {
+    if (!row.file) continue;
+    const filePath = qmdUriToLocalPath(row.file);
+    if (!isFredSharedPath(filePath) || seen.has(filePath.toLowerCase()) || !fs.existsSync(filePath)) continue;
+    try {
+      const meta = fileSummary(filePath);
+      results.push({ ...meta, link: threadLinkForFile(filePath), score: Number(row.score ?? 0), filePath });
+      seen.add(filePath.toLowerCase());
+    } catch (err) {
+      console.warn(`[fred-query] skip ${filePath}: ${(err as Error).message}`);
+    }
+  }
+  // QMD 索引可能落後於剛入庫的檔案；先完成規格要求的 BM25，再用本地檔案補足前三筆。
+  if (results.length < 3 && fs.existsSync(FRED_SHARED_DIR)) {
+    for (const name of fs.readdirSync(FRED_SHARED_DIR)) {
+      if (!name.endsWith(".md")) continue;
+      const filePath = path.join(FRED_SHARED_DIR, name);
+      if (seen.has(filePath.toLowerCase())) continue;
+      try {
+        const body = fs.readFileSync(filePath, "utf-8");
+        if (!body.toLocaleLowerCase().includes(keyword.toLocaleLowerCase())) continue;
+        const meta = fileSummary(filePath);
+        results.push({ ...meta, link: threadLinkForFile(filePath), score: 0, filePath });
+        seen.add(filePath.toLowerCase());
+      } catch (err) {
+        console.warn(`[fred-query] fallback skip ${filePath}: ${(err as Error).message}`);
+      }
+    }
+  }
+  results.sort((a, b) => (b.date.localeCompare(a.date) || b.score - a.score));
+  return results.slice(0, 3);
+}
+
+export function formatIntakeQueryResults(keyword: string, results: IntakeQueryResult[]): string {
+  if (results.length === 0) return `沒有找到含「${keyword}」的收料；試試別的字`;
+  return results.map((item, index) =>
+    `${index + 1}. ${item.date}｜${item.title}\n　${item.summary}\n　討論串：${item.link}`,
+  ).join("\n\n");
+}
+
+export async function handleIntakeQuery(keyword: string): Promise<string> {
+  return formatIntakeQueryResults(keyword, await searchIntakeFiles(keyword));
+}
+
+// 蒐集訊息附件：一般附件 + 「轉傳(forward)」的訊息快照裡的附件（轉傳的檔在 messageSnapshots，不在 top-level attachments）
+function gatherAttachments(message: any): any[] {
+  const atts = [...message.attachments.values()] as any[];
+  const snaps = (message as any).messageSnapshots;
+  if (snaps && typeof snaps.values === "function") {
+    for (const snap of snaps.values()) {
+      if (snap?.attachments && typeof snap.attachments.values === "function") {
+        atts.push(...snap.attachments.values());
+      }
+    }
+  }
+  return atts;
+}
+
+// 每個入庫檔在 #收料 開一條 thread，記 threadId→檔案，貼使用說明。回 thread 連結。
+async function createFileThread(fileName: string, filePath: string): Promise<string | null> {
+  try {
+    const ch: any = await client.channels.fetch(INTAKE_CHANNEL_ID);
+    if (!ch || typeof ch.threads?.create !== "function") return null;
+    // 同一份檔已有 thread → 重用連結，不重開
+    const existing = Object.entries(loadQaMap()).find(([, v]) => v.file === filePath);
+    if (existing) return `https://discord.com/channels/${ch.guildId}/${existing[0]}`;
+    const base = fileName.replace(/\.[^.]+$/, "").slice(0, 90) || "檔案";
+    const thread = await ch.threads.create({
+      name: `📄 ${base}`,
+      autoArchiveDuration: 10080,
+      type: ChannelType.PublicThread,
+      reason: "fred 收料檔案問答",
+    });
+    saveQaEntry(thread.id, { file: filePath, sessionId: crypto.randomUUID(), guildId: ch.guildId });
+    await thread.send(`已入庫這份材料。**在這條 thread 裡 @我問問題**（例：<@${client.user!.id}> 這份重點是什麼？），我只讀這一份檔回答，不會扯到別的。`).catch(() => {});
+    return `https://discord.com/channels/${ch.guildId}/${thread.id}`;
+  } catch (e) {
+    console.error("[fred-qa] create thread fail", e);
+    return null;
+  }
+}
+
+async function handleIntakeMessage(message: any): Promise<void> {
+  const atts = gatherAttachments(message);
+  const notice = await message.reply(`⏳ 收料中…（${atts.length} 個檔案）`);
+  const lines: string[] = [];
+  let anyOk = false;
+  for (const att of atts) {
+    const name = (att.name as string) ?? "unnamed";
+    if (att.size > INTAKE_MAX_BYTES) {
+      lines.push(`⚠️ ${name}：超過 50MB，跳過`);
+      continue;
+    }
+    const ext = name.split(".").pop() ?? "bin";
+    const filepath = path.join(ATTACH_TMP_DIR, `${message.id}_${att.id}.${ext}`);
+    try {
+      await downloadAttachment(att.url, filepath);
+    } catch {
+      lines.push(`❌ ${name}：下載失敗`);
+      continue;
+    }
+    const r = await runFredIntake(filepath, name);
+    if (r.status === "ok") {
+      anyOk = true;
+      const link = r.path ? await createFileThread(name, r.path) : null;
+      if (r.path && link) {
+        const threadId = link.split("/").pop();
+        if (threadId) summarizeIntakeFile(r.path, threadId, message.author.id).catch(err => {
+          console.error(`[fred-summary] intake summary pipeline failed: ${(err as Error).message}`);
+        });
+      }
+      lines.push(`✅ ${name} → 已入庫（${r.note ?? ""}）${link ? `\n　↳ 問這份材料：${link}` : ""}`);
+    }
+    else if (r.status === "duplicate") {
+      const link = r.path ? await createFileThread(name, r.path) : null;
+      lines.push(`↩️ ${name}：同內容已在庫${link ? `\n　↳ 問這份材料：${link}` : ""}`);
+    }
+    else if (r.status === "unsupported") lines.push(`⚠️ ${r.note ?? name}`);
+    else lines.push(`❌ ${name}：${r.note ?? "入庫失敗"}`);
+    // 只有「確定進庫了」才刪暫存原檔（ok＝新入庫、duplicate＝同內容已在庫）。
+    // 失敗時保留：2026-08-01 發現 4 張圖在入庫當下就被無條件刪除，claude vision
+    // 若逾時或轉錯，原圖等於永久消失（Discord 上還有，但要人工回頭撈）。
+    if (r.status === "ok" || r.status === "duplicate") {
+      fs.rm(filepath, () => {});
+    } else {
+      lines.push(`　↳ 原檔保留在 tmp-attachments/${path.basename(filepath)}，修好可重試`);
+    }
+  }
+  let tail = "";
+  if (anyOk) {
+    const ok = await runQmdUpdate();
+    tail = ok ? "\n\n🔎 qmd 索引已更新，現在可查。" : "\n\n🔎 已入庫，qmd 索引稍後更新。";
+  }
+  await notice.edit(`**收料完成**\n${lines.join("\n")}${tail}`).catch(() => {});
+}
+
+const X_HOSTS = new Set([
+  "x.com",
+  "twitter.com",
+  "fxtwitter.com",
+  "vxtwitter.com",
+  "fixupx.com",
+  "fixvx.com",
+]);
+const XTF_FETCH_PY = path.join(import.meta.dirname, "..", "scripts", "xtf_fetch.py");
+const XTF_FETCH_TIMEOUT_MS = 20_000;
+const VIDEO_CAPTION_PY = path.join(import.meta.dirname, "..", "scripts", "video_caption_fetch.py");
+const VIDEO_CAPTION_TIMEOUT_MS = 45_000;
+const ARXIV_FETCH_PY = path.join(import.meta.dirname, "..", "scripts", "arxiv_fetch.py");
+const ARXIV_FETCH_TIMEOUT_MS = 20_000;
+const NEWS_SCORE_PY = path.join(import.meta.dirname, "..", "scripts", "news_score.py");
+const NEWS_SCORE_TIMEOUT_MS = 8_000;
+const NEWS_BODY_MAX = 1200;
+const IMAGE_BRIEF_PY = path.join(import.meta.dirname, "..", "scripts", "image_prompt_brief.py");
+const IMAGE_BRIEF_TIMEOUT_MS = 8_000;
+const HTML_BRIEF_PY = path.join(import.meta.dirname, "..", "scripts", "html_artifact_brief.py");
+const HTML_BRIEF_TIMEOUT_MS = 8_000;
+const X_SEARCH_BRIEF_PY = path.join(import.meta.dirname, "..", "scripts", "x_search_brief.py");
+const X_SEARCH_BRIEF_TIMEOUT_MS = 8_000;
+const SOURCE_CITE_PY = path.join(import.meta.dirname, "..", "scripts", "source_cite_brief.py");
+const SOURCE_CITE_TIMEOUT_MS = 8_000;
+const LIB_SCOUT_BRIEF_PY = path.join(import.meta.dirname, "..", "scripts", "lib_scout_brief.py");
+const LIB_SCOUT_BRIEF_TIMEOUT_MS = 8_000;
+const ENG_ARTICLE_BRIEF_PY = path.join(import.meta.dirname, "..", "scripts", "eng_article_brief.py");
+const ENG_ARTICLE_BRIEF_TIMEOUT_MS = 8_000;
+const MONEY_PATH_BRIEF_PY = path.join(import.meta.dirname, "..", "scripts", "money_path_brief.py");
+const MONEY_PATH_BRIEF_TIMEOUT_MS = 8_000;
+const REACH_ROUTE_PY = path.join(import.meta.dirname, "..", "scripts", "reach_route_brief.py");
+const REACH_ROUTE_TIMEOUT_MS = 8_000;
+const SHORT_VIDEO_PY = path.join(import.meta.dirname, "..", "scripts", "short_video_brief.py");
+const SHORT_VIDEO_TIMEOUT_MS = 8_000;
+const FILE_TO_MD_PY = path.join(import.meta.dirname, "..", "scripts", "file_to_md.py");
+const FILE_TO_MD_TIMEOUT_MS = 30_000;
+const COWORKER_BRIEF_PY = path.join(import.meta.dirname, "..", "scripts", "coworker_brief.py");
+const COWORKER_BRIEF_TIMEOUT_MS = 8_000;
+const RECIPE_BRIEF_PY = path.join(import.meta.dirname, "..", "scripts", "recipe_brief.py");
+const RECIPE_BRIEF_TIMEOUT_MS = 8_000;
+const SUPERPOWERS_BRIEF_PY = path.join(import.meta.dirname, "..", "scripts", "superpowers_brief.py");
+const SUPERPOWERS_BRIEF_TIMEOUT_MS = 8_000;
+const ROSTER_BRIEF_PY = path.join(import.meta.dirname, "..", "scripts", "roster_brief.py");
+const ROSTER_BRIEF_TIMEOUT_MS = 8_000;
+const LEAD_ROUTE_PY = path.join(import.meta.dirname, "..", "scripts", "lead_route_brief.py");
+const LEAD_ROUTE_TIMEOUT_MS = 8_000;
+const ACCEPT_BRIEF_PY = path.join(import.meta.dirname, "..", "scripts", "accept_brief.py");
+const ACCEPT_BRIEF_TIMEOUT_MS = 8_000;
+const EVAL_SPEC_PY = path.join(import.meta.dirname, "..", "scripts", "eval_spec_brief.py");
+const EVAL_SPEC_TIMEOUT_MS = 8_000;
+const ORG_CHART_PY = path.join(import.meta.dirname, "..", "scripts", "org_chart_brief.py");
+const ORG_CHART_TIMEOUT_MS = 8_000;
+const LIB_SCOUT_RE =
+  /新庫|開源偵察|開源推薦|推薦開源|GitHubDaily|有什麼新的\s*repo|今天有什麼新庫|有沒有新的開源/i;
+const ENG_ARTICLE_RE =
+  /工程文|工程部落格|工程博客|engineering\s+blog|engineering\s+articles?|awesome-engineering|一手尺度|公司工程|怎麼\s*scale|怎么\s*scale|如何\s*scale|大規模.{0,10}(?:工程|系統|系统)|(?:怎麼|怎么|如何).{0,16}(?:擴展|扩展|分片|搜尋系統|搜索系统|快取|缓存)|(airbnb|amazon|atlassian|booking|canva|coinbase|discord|doordash|dropbox|ebay|facebook|meta|figma|netflix|網飛|uber|優步|stripe|shopify|slack|notion|figma).{0,20}(?:怎麼|怎么|工程|scale|擴展|扩展|搜尋|搜索|快取|缓存|分片)/i;
+const ENG_BLOG_HOST_RE =
+  /netflixtechblog|eng\.uber\.com|engineering\.fb\.com|shopify\.engineering|slack\.engineering|dropbox\.tech|canva\.dev|eng\.lyft\.com|eng\.snap\.com|engineering\.atspotify\.com|linkedin\.com\/blog\/engineering|tech\.instacart|careersatdoordash|innovation\.ebayinc|blog\.flipkart|engineering\.razorpay|engineering\.salesforce|bytes\.swiggy|blog\.zomato|amazon\.science|research\.google|github\.blog\/engineering|figma\.com\/blog|notion\.com\/blog|stripe\.com\/blog|blog\.discord|discord\.com\/blog|airbnb-engineering|booking-com-development|paypal-tech|pinterest-engineering|walmartglobaltech|redditeng|blog\.x\.com|blog\.twitter\.com|medium\.com\/tinder|blog\.twitch|atlassian\.com\/blog|coinbase\.com\/blog|uber\.com\/.*\/blog/i;
+const MONEY_PATH_RE =
+  /MakeMoneyWithAI|開源變現|開源赚钱|這庫.{0,10}(?:賺錢|赚钱|變現|变现|能賣|能卖)|這\s*repo.{0,10}(?:賺錢|赚钱|變現|变现)|(?:開源|这库|這庫|github).{0,16}(?:商業模式|商业模式|做成產品|做成产品)|monetize.{0,24}(?:open.?source|github|repo)|怎麼用.{0,16}開源.{0,8}(?:賺錢|赚钱)|github\.com\/\S+.{0,40}(?:賺錢|赚钱|變現|变现|monetize|能賣|能卖)/i;
+const REACH_INTENT_RE =
+  /Agent-?Reach|這平台抓得到|抓得到嗎|有沒有零配置|小紅書|小红书|xiaohongshu|雪球|搜\s*reddit|reddit\s*上|reddit\.com|幫我配\s*(Twitter|X|Reddit|小紅書|小红书|Facebook|Instagram|雪球|B站)|這[個條].{0,8}(?:reddit|小紅書|小红书|臉書|脸书|\bIG\b|instagram)/i;
+const GATED_REACH_HOST_RE =
+  /(^|\.)(reddit\.com|xiaohongshu\.com|xhslink\.com|facebook\.com|fb\.com|instagram\.com|xueqiu\.com)$/i;
+const SHORT_VIDEO_RE =
+  /MoneyPrinterTurbo|短影片|短視頻|短视频|一鍵.{0,6}(?:短)?影片|生成.{0,10}(?:短片|短影)|主題.{0,16}(?:短)?影片|做一[條個支則].{0,8}(?:短影|Shorts)|YouTube\s*Shorts|TikTok.{0,8}影片|豎屏影片|竖屏视频|配音字幕合成/i;
+const SHORT_VIDEO_CONSUME_RE = /影片筆記|這支講了什麼|这支讲了什么|字幕整理|逐字稿|Video transcript/i;
+const DOC_MD_RE =
+  /轉成?\s*markdown|转成?\s*markdown|markitdown|這份\s*pdf|这份\s*pdf|讀這個\s*(?:ppt|pptx|docx|excel|xlsx)|附件.{0,8}講什麼|附件.{0,8}讲什么/i;
+const COWORKER_RE =
+  /ClawWork|同事模式|coworker|這次要交檔|交作業|交付物|給我檔案路徑|做完交檔|工作還是學習|先做還是先學|submit_work/i;
+const RECIPE_RE =
+  /aaif-goose|goose\s*配方|goose\s*recipe|做成\s*recipe|存成配方|可重跑這套|這次流程做成配方|參數化流程|打包這套流程/i;
+const RECIPE_GHOST_RE = /ghost.?recipes?|UIA|元大同步|XQ\s*點擊|桌面點擊自動化/i;
+const SUPERPOWERS_RE =
+  /superpowers|先想清楚再寫|腦力激盪設計|brainstorm|先寫測試|RED.?GREEN|\bTDD\b|系統除錯|systematic.?debug|還沒驗不准說|verification.before|寫這個功能|實作這個|修這個\s*bug|拆實作計畫/i;
+const ROSTER_RE =
+  /GrokBot|0xCarnagee|人設檔|角色檔|角色合約|profile.?file|WHAT I PULL|兩清單|停車清單|允許清單|窄角色|抄花名冊|bot roster|給這個角色寫檔|寫這份角色/i;
+const LEAD_ROUTE_RE =
+  /Mahaximus|lead\s*bot|總管機器人|領隊機器人|協調機器人|該建哪個機器人|該開哪個\s*bot|先建哪個機器人|開一個機器人|建一個機器人|建一個\s*bot|開一個.{0,24}機器人|先取名|名字太模糊|一次性就不要建|不要建機器人|最明顯有用|會議簡報機器人|meeting\s*brief|first\s*draft\s*agent|睡覺還在跑|關機還跑|關對話還/i;
+const ACCEPT_RE =
+  /xiaomovps|獨立驗收|行動清單|行动清单|整理.{0,8}會議|整理.{0,8}会议|會議記錄.{0,20}清單|会议记录.{0,20}清单|不要信.{0,8}完成|不要改原檔|不要改原档|input\s*只讀|input\s*只读|材料.{0,4}動作.{0,4}限制.{0,4}驗收|材料.{0,4}动作.{0,4}限制.{0,4}验收|SHA-256.{0,16}(?:原檔|原档|輸入|输入)/i;
+const EVAL_SPEC_RE =
+  /Vtrivedy|eval-engineering|world\s*spec|task\s*spec|spec2task|世界規格|任務規格|評測規格|評測\s*Athena|Athena.{0,8}eval|Harbor.{0,12}(?:任務|規格|eval)|規格先於任務|先寫規格再/i;
+const ORG_CHART_RE =
+  /cyrilXBT|組織圖|org\s*chart|下一個部門|編制部門|編制.{0,16}部門|部門記分卡|執行長功能|策略留給我|一次開五個部門|不要一次開齊|這個部門證明了|部門證明|staff.{0,12}department|銷售部門|行銷部門|工程部門/i;
+const SOURCE_CITE_RE =
+  /調查|调查|彙整|多篇來源|多源|出處|出处|引用原文|典據|解釋這|解释这|什麼是.{0,12}機制|什么是.{0,12}机制|怎麼運作|怎么运作|survey|有沒有出處|根据哪|根據哪/i;
+const X_SEARCH_RE =
+  /搜\s*X|搜推特|搜\s*twitter|找推文|找回原帖|誰發過|谁发过|這個帳號發|这个账号发|進階搜尋|高级搜索|from:|高讚帖|高赞帖|X 上找|X上找|twitter 搜|找某人發|書籤找不到|某一天的帖|回覆給\s*@|回复给\s*@|(?:找|搜).{0,24}(?:帖|推文|twitter)|@[A-Za-z0-9_]{1,15}.{0,12}(?:發了|发了|發過|发过)/i;
+const HTML_ARTIFACT_RE =
+  /線框|线框|wireframe|低保真|互動原型|原型|prototype|mockup|設計這個畫面|设计这个画面|html\s*頁|單檔\s*html|自包含|落地頁|landing\s*page|做一個頁面|做个页面|做個頁面|儀表板頁|仪表板页|做成手札|圖解|图解|架構圖|架构图|時序圖|时序图|狀態圖|流程圖|流程图|投影片|做簡報|做简报|計畫頁|计划页|roadmap|eli5|講到我看得懂|當我完全不懂|怎麼串/i;
+const IMAGE_GEN_RE =
+  /生圖|生图|畫一[張個]|画一[张个]|畫張|畫個|画张|画个|做封面|封面圖|封面图|資訊圖|信息图|海報|海报|角色圖|角色图|示意圖|示意图|出一張圖|出一张图|生成一張|生成一张|mockup|infographic|poster|generate an image|draw me|風格庫|风格库|工業級提示|工业级提示|提示詞模板|做一張圖|做一张图|ui\s*截圖|ui截图/i;
+const IMAGE_ANALYZE_RE = /這張圖是|这张图是|圖裡|图里|看這張圖|看这张图/;
+const VIDEO_HOSTS = new Set([
+  "youtube.com",
+  "www.youtube.com",
+  "m.youtube.com",
+  "youtu.be",
+  "bilibili.com",
+  "www.bilibili.com",
+  "m.bilibili.com",
+  "b23.tv",
+]);
+
+function isXStatusUrl(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.replace(/^www\./, "").toLowerCase();
+    return X_HOSTS.has(host) && /\/status\/\d+/i.test(url);
+  } catch {
+    return false;
+  }
+}
+
+function fetchNewsScore(url: string, also: string[]): Promise<string | null> {
+  return new Promise((resolve) => {
+    const args = [NEWS_SCORE_PY, url];
+    if (also.length) args.push("--also", ...also.slice(0, 8));
+    execFile(
+      "python",
+      args,
+      { timeout: NEWS_SCORE_TIMEOUT_MS, windowsHide: true, encoding: "utf8" },
+      (err, stdout, stderr) => {
+        const text = (stdout ?? "").trim();
+        if (err || !text) {
+          console.error(`[discord-cc-bot] news score failed for ${url}:`, stderr?.trim() || err);
+          resolve(null);
+          return;
+        }
+        resolve(text);
+      },
+    );
+  });
+}
+
+function isImageGenIntent(text: string): boolean {
+  if (IMAGE_ANALYZE_RE.test(text) && !IMAGE_GEN_RE.test(text)) return false;
+  return IMAGE_GEN_RE.test(text);
+}
+
+function isShortVideoIntent(text: string): boolean {
+  if (SHORT_VIDEO_CONSUME_RE.test(text) && !SHORT_VIDEO_RE.test(text)) return false;
+  return SHORT_VIDEO_RE.test(text);
+}
+
+function isDocMdIntent(text: string): boolean {
+  return DOC_MD_RE.test(text);
+}
+
+function isCoworkerIntent(text: string): boolean {
+  if (/(該不該買|這檔|ticker|財報)/i.test(text) && !COWORKER_RE.test(text)) return false;
+  return COWORKER_RE.test(text);
+}
+
+function isRecipeIntent(text: string): boolean {
+  if (RECIPE_GHOST_RE.test(text)) return false;
+  if (/(該不該買|這檔|ticker|財報)/i.test(text)) return false;
+  return RECIPE_RE.test(text);
+}
+
+function isSuperpowersIntent(text: string): boolean {
+  if (/(該不該買|這檔|ticker|財報)/i.test(text)) return false;
+  return SUPERPOWERS_RE.test(text);
+}
+
+function isRosterIntent(text: string): boolean {
+  if (/(該不該買|這檔|ticker|財報)/i.test(text)) return false;
+  return ROSTER_RE.test(text);
+}
+
+function isLeadRouteIntent(text: string): boolean {
+  if (/(該不該買|這檔|ticker|財報)/i.test(text)) return false;
+  if (/人設檔|角色檔|兩清單|WHAT I PULL/i.test(text) && !LEAD_ROUTE_RE.test(text)) return false;
+  return LEAD_ROUTE_RE.test(text);
+}
+
+function isAcceptIntent(text: string): boolean {
+  if (/(該不該買|這檔|ticker|財報)/i.test(text)) return false;
+  if (/(該建哪個機器人|開一個機器人|lead\s*bot)/i.test(text) && !ACCEPT_RE.test(text)) return false;
+  return ACCEPT_RE.test(text);
+}
+
+function isEvalSpecIntent(text: string): boolean {
+  if (/(該不該買|這檔|ticker|財報)/i.test(text)) return false;
+  if (/(獨立驗收|行動清單|整理.{0,8}會議)/i.test(text) && !EVAL_SPEC_RE.test(text)) return false;
+  return EVAL_SPEC_RE.test(text);
+}
+
+function isOrgChartIntent(text: string): boolean {
+  if (/(該不該買|這檔|ticker|財報)/i.test(text)) return false;
+  if (/(該建哪個機器人|開一個機器人|lead\s*bot|人設檔|兩清單)/i.test(text) && !ORG_CHART_RE.test(text)) {
+    return false;
+  }
+  return ORG_CHART_RE.test(text);
+}
+
+function isHtmlArtifactIntent(text: string): boolean {
+  return HTML_ARTIFACT_RE.test(text);
+}
+
+function isXSearchIntent(text: string): boolean {
+  return X_SEARCH_RE.test(text);
+}
+
+function isSourceCiteIntent(text: string): boolean {
+  return SOURCE_CITE_RE.test(text);
+}
+
+function isLibScoutIntent(text: string): boolean {
+  return LIB_SCOUT_RE.test(text);
+}
+
+function isEngBlogUrl(url: string): boolean {
+  return ENG_BLOG_HOST_RE.test(url);
+}
+
+function isEngArticleIntent(text: string): boolean {
+  return ENG_ARTICLE_RE.test(text) || ENG_BLOG_HOST_RE.test(text);
+}
+
+function isMoneyPathIntent(text: string): boolean {
+  if (/(該不該買|这档|這檔|這支股|ticker|財報)/i.test(text) && !/github\.com|開源|這庫/.test(text)) {
+    return false;
+  }
+  return MONEY_PATH_RE.test(text);
+}
+
+function isGatedReachUrl(url: string): boolean {
+  try {
+    const u = new URL(url);
+    const host = u.hostname.replace(/^www\./, "").toLowerCase();
+    if (GATED_REACH_HOST_RE.test(host)) return true;
+    if (X_HOSTS.has(host) && !/\/status\/\d+/i.test(url)) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function isReachIntent(text: string): boolean {
+  if (REACH_INTENT_RE.test(text)) return true;
+  const urlRegex = /(https?:\/\/[^\s]+)/g;
+  return [...text.matchAll(urlRegex)].some((m) => isGatedReachUrl(m[1]));
+}
+
+function fetchLibScoutBrief(text: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(
+      "python",
+      [LIB_SCOUT_BRIEF_PY, text.slice(0, 2000)],
+      {
+        timeout: LIB_SCOUT_BRIEF_TIMEOUT_MS,
+        windowsHide: true,
+        encoding: "utf8",
+        env: { ...process.env, PYTHONUTF8: "1" },
+      },
+      (err, stdout, stderr) => {
+        const body = (stdout ?? "").trim();
+        if (err || !body || body === "not_scout") {
+          if (stderr?.trim()) {
+            console.error(`[discord-cc-bot] lib scout brief failed:`, stderr.trim() || err);
+          }
+          resolve(null);
+          return;
+        }
+        resolve(body);
+      },
+    );
+  });
+}
+
+function fetchEngArticleBrief(text: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(
+      "python",
+      [ENG_ARTICLE_BRIEF_PY, text.slice(0, 2000)],
+      {
+        timeout: ENG_ARTICLE_BRIEF_TIMEOUT_MS,
+        windowsHide: true,
+        encoding: "utf8",
+        env: { ...process.env, PYTHONUTF8: "1" },
+      },
+      (err, stdout, stderr) => {
+        const body = (stdout ?? "").trim();
+        if (err || !body || body === "not_eng_article") {
+          if (stderr?.trim()) {
+            console.error(`[discord-cc-bot] eng article brief failed:`, stderr.trim() || err);
+          }
+          resolve(null);
+          return;
+        }
+        resolve(body);
+      },
+    );
+  });
+}
+
+function fetchMoneyPathBrief(text: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(
+      "python",
+      [MONEY_PATH_BRIEF_PY, text.slice(0, 2000)],
+      {
+        timeout: MONEY_PATH_BRIEF_TIMEOUT_MS,
+        windowsHide: true,
+        encoding: "utf8",
+        env: { ...process.env, PYTHONUTF8: "1" },
+      },
+      (err, stdout, stderr) => {
+        const body = (stdout ?? "").trim();
+        if (err || !body || body === "not_money_path") {
+          if (stderr?.trim()) {
+            console.error(`[discord-cc-bot] money path brief failed:`, stderr.trim() || err);
+          }
+          resolve(null);
+          return;
+        }
+        resolve(body);
+      },
+    );
+  });
+}
+
+function fetchSuperpowersBrief(text: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(
+      "python",
+      [SUPERPOWERS_BRIEF_PY, text.slice(0, 2000)],
+      {
+        timeout: SUPERPOWERS_BRIEF_TIMEOUT_MS,
+        windowsHide: true,
+        encoding: "utf8",
+        env: { ...process.env, PYTHONUTF8: "1" },
+      },
+      (err, stdout, stderr) => {
+        const body = (stdout ?? "").trim();
+        if (err || !body || body === "not_superpowers") {
+          if (stderr?.trim()) {
+            console.error(`[discord-cc-bot] superpowers brief failed:`, stderr.trim() || err);
+          }
+          resolve(null);
+          return;
+        }
+        resolve(body);
+      },
+    );
+  });
+}
+
+function fetchRosterBrief(text: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(
+      "python",
+      [ROSTER_BRIEF_PY, text.slice(0, 2000)],
+      {
+        timeout: ROSTER_BRIEF_TIMEOUT_MS,
+        windowsHide: true,
+        encoding: "utf8",
+        env: { ...process.env, PYTHONUTF8: "1" },
+      },
+      (err, stdout, stderr) => {
+        const body = (stdout ?? "").trim();
+        if (err || !body || body === "not_roster") {
+          if (stderr?.trim()) {
+            console.error(`[discord-cc-bot] roster brief failed:`, stderr.trim() || err);
+          }
+          resolve(null);
+          return;
+        }
+        resolve(body);
+      },
+    );
+  });
+}
+
+function fetchLeadRouteBrief(text: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(
+      "python",
+      [LEAD_ROUTE_PY, text.slice(0, 2000)],
+      {
+        timeout: LEAD_ROUTE_TIMEOUT_MS,
+        windowsHide: true,
+        encoding: "utf8",
+        env: { ...process.env, PYTHONUTF8: "1" },
+      },
+      (err, stdout, stderr) => {
+        const body = (stdout ?? "").trim();
+        if (err || !body || body === "not_lead") {
+          if (stderr?.trim()) {
+            console.error(`[discord-cc-bot] lead route brief failed:`, stderr.trim() || err);
+          }
+          resolve(null);
+          return;
+        }
+        resolve(body);
+      },
+    );
+  });
+}
+
+function fetchAcceptBrief(text: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(
+      "python",
+      [ACCEPT_BRIEF_PY, text.slice(0, 2000)],
+      {
+        timeout: ACCEPT_BRIEF_TIMEOUT_MS,
+        windowsHide: true,
+        encoding: "utf8",
+        env: { ...process.env, PYTHONUTF8: "1" },
+      },
+      (err, stdout, stderr) => {
+        const body = (stdout ?? "").trim();
+        if (err || !body || body === "not_accept") {
+          if (stderr?.trim()) {
+            console.error(`[discord-cc-bot] accept brief failed:`, stderr.trim() || err);
+          }
+          resolve(null);
+          return;
+        }
+        resolve(body);
+      },
+    );
+  });
+}
+
+function fetchEvalSpecBrief(text: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(
+      "python",
+      [EVAL_SPEC_PY, text.slice(0, 2000)],
+      {
+        timeout: EVAL_SPEC_TIMEOUT_MS,
+        windowsHide: true,
+        encoding: "utf8",
+        env: { ...process.env, PYTHONUTF8: "1" },
+      },
+      (err, stdout, stderr) => {
+        const body = (stdout ?? "").trim();
+        if (err || !body || body === "not_eval_spec") {
+          if (stderr?.trim()) {
+            console.error(`[discord-cc-bot] eval spec brief failed:`, stderr.trim() || err);
+          }
+          resolve(null);
+          return;
+        }
+        resolve(body);
+      },
+    );
+  });
+}
+
+function fetchOrgChartBrief(text: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(
+      "python",
+      [ORG_CHART_PY, text.slice(0, 2000)],
+      {
+        timeout: ORG_CHART_TIMEOUT_MS,
+        windowsHide: true,
+        encoding: "utf8",
+        env: { ...process.env, PYTHONUTF8: "1" },
+      },
+      (err, stdout, stderr) => {
+        const body = (stdout ?? "").trim();
+        if (err || !body || body === "not_org") {
+          if (stderr?.trim()) {
+            console.error(`[discord-cc-bot] org chart brief failed:`, stderr.trim() || err);
+          }
+          resolve(null);
+          return;
+        }
+        resolve(body);
+      },
+    );
+  });
+}
+
+function fetchRecipeBrief(text: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(
+      "python",
+      [RECIPE_BRIEF_PY, text.slice(0, 2000)],
+      {
+        timeout: RECIPE_BRIEF_TIMEOUT_MS,
+        windowsHide: true,
+        encoding: "utf8",
+        env: { ...process.env, PYTHONUTF8: "1" },
+      },
+      (err, stdout, stderr) => {
+        const body = (stdout ?? "").trim();
+        if (err || !body || body === "not_recipe") {
+          if (stderr?.trim()) {
+            console.error(`[discord-cc-bot] recipe brief failed:`, stderr.trim() || err);
+          }
+          resolve(null);
+          return;
+        }
+        resolve(body);
+      },
+    );
+  });
+}
+
+function fetchCoworkerBrief(text: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(
+      "python",
+      [COWORKER_BRIEF_PY, text.slice(0, 2000)],
+      {
+        timeout: COWORKER_BRIEF_TIMEOUT_MS,
+        windowsHide: true,
+        encoding: "utf8",
+        env: { ...process.env, PYTHONUTF8: "1" },
+      },
+      (err, stdout, stderr) => {
+        const body = (stdout ?? "").trim();
+        if (err || !body || body === "not_coworker") {
+          if (stderr?.trim()) {
+            console.error(`[discord-cc-bot] coworker brief failed:`, stderr.trim() || err);
+          }
+          resolve(null);
+          return;
+        }
+        resolve(body);
+      },
+    );
+  });
+}
+
+function fetchShortVideoBrief(text: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(
+      "python",
+      [SHORT_VIDEO_PY, text.slice(0, 2000)],
+      {
+        timeout: SHORT_VIDEO_TIMEOUT_MS,
+        windowsHide: true,
+        encoding: "utf8",
+        env: { ...process.env, PYTHONUTF8: "1" },
+      },
+      (err, stdout, stderr) => {
+        const body = (stdout ?? "").trim();
+        if (err || !body || body === "not_short_video") {
+          if (stderr?.trim()) {
+            console.error(`[discord-cc-bot] short video brief failed:`, stderr.trim() || err);
+          }
+          resolve(null);
+          return;
+        }
+        resolve(body);
+      },
+    );
+  });
+}
+
+function fetchReachRouteBrief(text: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(
+      "python",
+      [REACH_ROUTE_PY, text.slice(0, 2000)],
+      {
+        timeout: REACH_ROUTE_TIMEOUT_MS,
+        windowsHide: true,
+        encoding: "utf8",
+        env: { ...process.env, PYTHONUTF8: "1" },
+      },
+      (err, stdout, stderr) => {
+        const body = (stdout ?? "").trim();
+        if (err || !body || body === "not_reach") {
+          if (stderr?.trim()) {
+            console.error(`[discord-cc-bot] reach route brief failed:`, stderr.trim() || err);
+          }
+          resolve(null);
+          return;
+        }
+        resolve(body);
+      },
+    );
+  });
+}
+
+function fetchSourceCiteBrief(text: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(
+      "python",
+      [SOURCE_CITE_PY, text.slice(0, 2000)],
+      {
+        timeout: SOURCE_CITE_TIMEOUT_MS,
+        windowsHide: true,
+        encoding: "utf8",
+        env: { ...process.env, PYTHONUTF8: "1" },
+      },
+      (err, stdout, stderr) => {
+        const body = (stdout ?? "").trim();
+        if (err || !body || body === "not_sourced") {
+          if (stderr?.trim()) {
+            console.error(`[discord-cc-bot] source cite brief failed:`, stderr.trim() || err);
+          }
+          resolve(null);
+          return;
+        }
+        resolve(body);
+      },
+    );
+  });
+}
+
+function fetchXSearchBrief(text: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(
+      "python",
+      [X_SEARCH_BRIEF_PY, text.slice(0, 2000)],
+      {
+        timeout: X_SEARCH_BRIEF_TIMEOUT_MS,
+        windowsHide: true,
+        encoding: "utf8",
+        env: { ...process.env, PYTHONUTF8: "1" },
+      },
+      (err, stdout, stderr) => {
+        const body = (stdout ?? "").trim();
+        if (err || !body || body === "not_x_search") {
+          if (stderr?.trim()) {
+            console.error(`[discord-cc-bot] x search brief failed:`, stderr.trim() || err);
+          }
+          resolve(null);
+          return;
+        }
+        resolve(body);
+      },
+    );
+  });
+}
+
+function fetchHtmlBrief(text: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(
+      "python",
+      [HTML_BRIEF_PY, text.slice(0, 2000)],
+      {
+        timeout: HTML_BRIEF_TIMEOUT_MS,
+        windowsHide: true,
+        encoding: "utf8",
+        env: { ...process.env, PYTHONUTF8: "1" },
+      },
+      (err, stdout, stderr) => {
+        const body = (stdout ?? "").trim();
+        if (err || !body || body === "not_html_artifact") {
+          if (stderr?.trim()) {
+            console.error(`[discord-cc-bot] html brief failed:`, stderr.trim() || err);
+          }
+          resolve(null);
+          return;
+        }
+        resolve(body);
+      },
+    );
+  });
+}
+
+function fetchImageBrief(text: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(
+      "python",
+      [IMAGE_BRIEF_PY, text.slice(0, 2000)],
+      {
+        timeout: IMAGE_BRIEF_TIMEOUT_MS,
+        windowsHide: true,
+        encoding: "utf8",
+        env: { ...process.env, PYTHONUTF8: "1" },
+      },
+      (err, stdout, stderr) => {
+        const body = (stdout ?? "").trim();
+        if (err || !body || body === "not_image_gen") {
+          if (stderr?.trim()) {
+            console.error(`[discord-cc-bot] image brief failed:`, stderr.trim() || err);
+          }
+          resolve(null);
+          return;
+        }
+        resolve(body);
+      },
+    );
+  });
+}
+
+function isArxivUrl(url: string): boolean {
+  try {
+    const u = new URL(url);
+    const host = u.hostname.replace(/^www\./, "").toLowerCase();
+    return (host === "arxiv.org" || host === "export.arxiv.org") && /\/(abs|pdf|html)\//i.test(u.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function fetchArxivCard(url: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(
+      "python",
+      [ARXIV_FETCH_PY, url],
+      { timeout: ARXIV_FETCH_TIMEOUT_MS, windowsHide: true, encoding: "utf8" },
+      (err, stdout, stderr) => {
+        const text = (stdout ?? "").trim();
+        if (err || !text) {
+          console.error(`[discord-cc-bot] arxiv fetch failed for ${url}:`, stderr?.trim() || err);
+          resolve(null);
+          return;
+        }
+        resolve(text);
+      },
+    );
+  });
+}
+
+function isVideoUrl(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.replace(/^www\./, "").toLowerCase();
+    return VIDEO_HOSTS.has(host) || host.endsWith("youtube.com") || host.endsWith("bilibili.com");
+  } catch {
+    return false;
+  }
+}
+
+function fetchVideoCaptions(url: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(
+      "python",
+      [VIDEO_CAPTION_PY, url],
+      { timeout: VIDEO_CAPTION_TIMEOUT_MS, windowsHide: true, encoding: "utf8" },
+      (err, stdout, stderr) => {
+        const text = (stdout ?? "").trim();
+        if (err || !text) {
+          console.error(`[discord-cc-bot] video caption failed for ${url}:`, stderr?.trim() || err);
+          resolve(null);
+          return;
+        }
+        resolve(text);
+      },
+    );
+  });
+}
+
+function fetchXStatusText(url: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(
+      "python",
+      [XTF_FETCH_PY, url],
+      { timeout: XTF_FETCH_TIMEOUT_MS, windowsHide: true, encoding: "utf8" },
+      (err, stdout, stderr) => {
+        const text = (stdout ?? "").trim();
+        if (err || !text) {
+          console.error(`[discord-cc-bot] xtf fetch failed for ${url}:`, stderr?.trim() || err);
+          resolve(null);
+          return;
+        }
+        resolve(text);
+      },
+    );
+  });
+}
+
+// --- URL Interception (X via xtf, else Jina AI) ---
+async function expandUrlsWithJina(text: string, previewState: PreviewState): Promise<string> {
+  const urlRegex = /(https?:\/\/[^\s]+)/g;
+  const urls = [...text.matchAll(urlRegex)].map(m => m[1]);
+  let expandedText = text;
+  let xFetched = 0;
+  for (const url of urls) {
+    // Skip if it's already a jina URL or a known local/internal IP
+    if (url.startsWith("https://r.jina.ai/") || url.includes("127.0.0.1") || url.includes("localhost")) continue;
+
+    if (isXStatusUrl(url)) {
+      if (xFetched >= 3) continue;
+      try {
+        if (previewState.msg) {
+          await previewState.msg.edit("⏳ *正在抓 X 全文...*").catch(() => {});
+        }
+        const body = await fetchXStatusText(url);
+        if (body) {
+          xFetched += 1;
+          expandedText += `\n\n--- Content from ${url} ---\n${body}\n--- End of ${url} ---`;
+          continue;
+        }
+      } catch (err) {
+        console.error(`[discord-cc-bot] xtf fetch threw for ${url}:`, err);
+      }
+      continue;
+    }
+
+    if (isArxivUrl(url)) {
+      try {
+        if (previewState.msg) {
+          await previewState.msg.edit("⏳ *正在登錄論文巢（摘要階段，未讀 PDF）...*").catch(() => {});
+        }
+        const body = await fetchArxivCard(url);
+        if (body) {
+          expandedText += `\n\n--- Paper card from ${url} ---\n${body}\n--- End of ${url} ---`;
+        } else {
+          expandedText += `\n\n--- Paper card from ${url} ---\nFETCH_FAILED: 論文卡沒登錄成功。禁止假裝已讀、禁止當日報交付。\n--- End of ${url} ---`;
+        }
+      } catch (err) {
+        console.error(`[discord-cc-bot] arxiv fetch threw for ${url}:`, err);
+      }
+      continue;
+    }
+
+    if (isVideoUrl(url)) {
+      try {
+        if (previewState.msg) {
+          await previewState.msg.edit("⏳ *正在抓影片字幕（有時間軸，不猜秒數）...*").catch(() => {});
+        }
+        const body = await fetchVideoCaptions(url);
+        if (body) {
+          expandedText += `\n\n--- Video transcript from ${url} ---\n${body}\n--- End of ${url} ---`;
+        } else {
+          expandedText += `\n\n--- Video transcript from ${url} ---\nNO_CAPTIONS: 這支沒有可用字幕，禁止瞎編時間軸與內容。請說實話沒抓到。\n--- End of ${url} ---`;
+        }
+      } catch (err) {
+        console.error(`[discord-cc-bot] video caption threw for ${url}:`, err);
+      }
+      continue;
+    }
+
+    if (isGatedReachUrl(url)) {
+      try {
+        if (previewState.msg) {
+          await previewState.msg.edit("⏳ *正在判平台路徑（沒有零配置就不抓）...*").catch(() => {});
+        }
+        const brief = await fetchReachRouteBrief(url);
+        const body = brief || "active: none\nlogin: yes\nfail: 這平台 Discord 沒有零配置路徑，禁止把登入牆當正文。";
+        expandedText += `\n\n--- Reach card from ${url} ---\n${body}\n--- End of ${url} ---`;
+      } catch (err) {
+        console.error(`[discord-cc-bot] reach card failed for ${url}:`, err);
+      }
+      continue;
+    }
+
+    if (isEngBlogUrl(url)) {
+      try {
+        if (previewState.msg) {
+          await previewState.msg.edit("⏳ *正在當一手工程文讀（不是新聞）...*").catch(() => {});
+        }
+        let body = "";
+        try {
+          const res = await fetch(`https://r.jina.ai/${url}`);
+          if (res.ok) body = (await res.text()).slice(0, NEWS_BODY_MAX);
+        } catch (err) {
+          console.error(`[discord-cc-bot] Jina fetch failed for eng article ${url}:`, err);
+        }
+        expandedText += `\n\n--- Eng article card from ${url} ---\n${body || "(no body)"}\n--- End of ${url} ---`;
+      } catch (err) {
+        console.error(`[discord-cc-bot] eng article card failed for ${url}:`, err);
+      }
+      continue;
+    }
+
+    try {
+      if (previewState.msg) {
+        await previewState.msg.edit(`⏳ *抓新聞並打證據分...*`).catch(() => {});
+      }
+      const also = urls.filter((u) => u !== url).slice(0, 8);
+      const score = await fetchNewsScore(url, also);
+      let body = "";
+      try {
+        const res = await fetch(`https://r.jina.ai/${url}`);
+        if (res.ok) body = (await res.text()).slice(0, NEWS_BODY_MAX);
+      } catch (err) {
+        console.error(`[discord-cc-bot] Jina fetch failed for ${url}:`, err);
+      }
+      const scoreBlock = score || "gate: WATCH\nconfidence: 0\nheat: 0\nrule: score failed; treat as 觀察中.";
+      expandedText += `\n\n--- News card from ${url} ---\n${scoreBlock}\n\n${body || "(no body)"}\n--- End of ${url} ---`;
+    } catch (err) {
+      console.error(`[discord-cc-bot] news card failed for ${url}:`, err);
+    }
+  }
+
+  const htmlIntent = isHtmlArtifactIntent(text);
+  const shortVideoIntent = isShortVideoIntent(text);
+  if (shortVideoIntent) {
+    try {
+      if (previewState.msg) {
+        await previewState.msg.edit("⏳ *正在寫短影片分鏡（不合成 MP4）...*").catch(() => {});
+      }
+      const brief = await fetchShortVideoBrief(text);
+      if (brief) {
+        expandedText += `\n\n--- Short video brief ---\n${brief}\n--- End of short video brief ---`;
+      } else {
+        expandedText += `\n\n--- Short video brief ---\nkind: short-video-spec\nstop_at: spec\ncannot_render: discord-oneshot 不合成 MP4；禁止假裝已交成片\n--- End of short video brief ---`;
+      }
+    } catch (err) {
+      console.error(`[discord-cc-bot] short video brief threw:`, err);
+    }
+  } else if (htmlIntent) {
+    try {
+      if (previewState.msg) {
+        await previewState.msg.edit("⏳ *正在判 HTML 產物保真度（Discord 不渲染）...*").catch(() => {});
+      }
+      const brief = await fetchHtmlBrief(text);
+      if (brief) {
+        expandedText += `\n\n--- HTML artifact brief ---\n${brief}\n--- End of HTML artifact brief ---`;
+      } else {
+        expandedText += `\n\n--- HTML artifact brief ---\nkind: report\ndelivery: spec-only\ncannot_render: discord-oneshot 渲染不了 HTML；禁止假裝已交檔\nroute_to: baoyu-design\n--- End of HTML artifact brief ---`;
+      }
+    } catch (err) {
+      console.error(`[discord-cc-bot] html brief threw:`, err);
+    }
+  } else if (isImageGenIntent(text)) {
+    try {
+      if (previewState.msg) {
+        await previewState.msg.edit("⏳ *正在套生圖結構（提示詞當程式，不產 PNG）...*").catch(() => {});
+      }
+      const brief = await fetchImageBrief(text);
+      if (brief) {
+        expandedText += `\n\n--- Image brief from Prompt-as-Code ---\n${brief}\n--- End of image brief ---`;
+      } else {
+        expandedText += `\n\n--- Image brief from Prompt-as-Code ---\ncategory: other\ndelivery: prompt-only\ncannot_render: discord-oneshot 不產 PNG；禁止假裝已經生圖\nblocks: subject | layout | style | text_lock | ratio | constraints\n--- End of image brief ---`;
+      }
+    } catch (err) {
+      console.error(`[discord-cc-bot] image brief threw:`, err);
+    }
+  }
+
+  if (isXSearchIntent(text) && !htmlIntent && !shortVideoIntent) {
+    try {
+      if (previewState.msg) {
+        await previewState.msg.edit("⏳ *正在組 X 精準搜（從寬到窄）...*").catch(() => {});
+      }
+      const brief = await fetchXSearchBrief(text);
+      if (brief) {
+        expandedText += `\n\n--- X search brief ---\n${brief}\n--- End of X search brief ---`;
+      }
+    } catch (err) {
+      console.error(`[discord-cc-bot] x search brief threw:`, err);
+    }
+  }
+
+  if (isSourceCiteIntent(text) && !htmlIntent && !isImageGenIntent(text) && !shortVideoIntent) {
+    try {
+      if (previewState.msg) {
+        await previewState.msg.edit("⏳ *正在套典據寫作（主張先、原句後）...*").catch(() => {});
+      }
+      const brief = await fetchSourceCiteBrief(text);
+      if (brief) {
+        expandedText += `\n\n--- Source cite brief ---\n${brief}\n--- End of source cite brief ---`;
+      }
+    } catch (err) {
+      console.error(`[discord-cc-bot] source cite brief threw:`, err);
+    }
+  }
+
+  if (isLibScoutIntent(text) && !htmlIntent && !isImageGenIntent(text) && !shortVideoIntent) {
+    try {
+      if (previewState.msg) {
+        await previewState.msg.edit("⏳ *正在用策展口徑挑庫（不是星數榜）...*").catch(() => {});
+      }
+      const brief = await fetchLibScoutBrief(text);
+      if (brief) {
+        expandedText += `\n\n--- Lib scout brief ---\n${brief}\n--- End of lib scout brief ---`;
+      }
+    } catch (err) {
+      console.error(`[discord-cc-bot] lib scout brief threw:`, err);
+    }
+  }
+
+  if (isEngArticleIntent(text) && !htmlIntent && !isImageGenIntent(text) && !shortVideoIntent) {
+    try {
+      if (previewState.msg) {
+        await previewState.msg.edit("⏳ *正在套一手尺度工程文口徑（公司＋主題＋年）...*").catch(() => {});
+      }
+      const brief = await fetchEngArticleBrief(text);
+      if (brief) {
+        expandedText += `\n\n--- Eng article brief ---\n${brief}\n--- End of eng article brief ---`;
+      }
+    } catch (err) {
+      console.error(`[discord-cc-bot] eng article brief threw:`, err);
+    }
+  }
+
+  if (isMoneyPathIntent(text) && !htmlIntent && !isImageGenIntent(text) && !shortVideoIntent) {
+    try {
+      if (previewState.msg) {
+        await previewState.msg.edit("⏳ *正在套開源錢路口徑（能力→錢路，不是星數榜）...*").catch(() => {});
+      }
+      const brief = await fetchMoneyPathBrief(text);
+      if (brief) {
+        expandedText += `\n\n--- Money path brief ---\n${brief}\n--- End of money path brief ---`;
+      }
+    } catch (err) {
+      console.error(`[discord-cc-bot] money path brief threw:`, err);
+    }
+  }
+
+  if (isDocMdIntent(text) && !htmlIntent && !isImageGenIntent(text) && !shortVideoIntent) {
+    try {
+      if (previewState.msg) {
+        await previewState.msg.edit("⏳ *正在套文件轉 markdown（給模型看結構，不排版）...*").catch(() => {});
+      }
+      expandedText += `\n\n--- Doc markdown brief ---\nkind: doc-markdown\nwhy: 模型吃結構 markdown，不是人讀精美稿\nlocal: 只轉本機附件；抽出太少＝沒讀到\nno: 不裝 markitdown、不開 Azure\n--- End of doc markdown brief ---`;
+    } catch (err) {
+      console.error(`[discord-cc-bot] doc md brief threw:`, err);
+    }
+  }
+
+  if (isReachIntent(text) && !htmlIntent && !isImageGenIntent(text) && !shortVideoIntent) {
+    try {
+      if (previewState.msg) {
+        await previewState.msg.edit("⏳ *正在套能力層路由（有路才抓，沒路就說沒有）...*").catch(() => {});
+      }
+      const brief = await fetchReachRouteBrief(text);
+      if (brief) {
+        expandedText += `\n\n--- Reach route brief ---\n${brief}\n--- End of reach route brief ---`;
+      }
+    } catch (err) {
+      console.error(`[discord-cc-bot] reach route brief threw:`, err);
+    }
+  }
+
+  if (isCoworkerIntent(text) && !htmlIntent && !isImageGenIntent(text) && !shortVideoIntent) {
+    try {
+      if (previewState.msg) {
+        await previewState.msg.edit("⏳ *正在套同事口徑（做要交檔，學要寫進記憶）...*").catch(() => {});
+      }
+      const brief = await fetchCoworkerBrief(text);
+      if (brief) {
+        expandedText += `\n\n--- Coworker brief ---\n${brief}\n--- End of coworker brief ---`;
+      }
+    } catch (err) {
+      console.error(`[discord-cc-bot] coworker brief threw:`, err);
+    }
+  }
+
+  if (isRecipeIntent(text) && !htmlIntent && !isImageGenIntent(text) && !shortVideoIntent) {
+    try {
+      if (previewState.msg) {
+        await previewState.msg.edit("⏳ *正在打包可重跑配方（參數＋成功條件）...*").catch(() => {});
+      }
+      const brief = await fetchRecipeBrief(text);
+      if (brief) {
+        expandedText += `\n\n--- Recipe brief ---\n${brief}\n--- End of recipe brief ---`;
+      }
+    } catch (err) {
+      console.error(`[discord-cc-bot] recipe brief threw:`, err);
+    }
+  }
+
+  if (isSuperpowersIntent(text) && !htmlIntent && !isImageGenIntent(text) && !shortVideoIntent) {
+    try {
+      if (previewState.msg) {
+        await previewState.msg.edit("⏳ *正在套建造流程（先想、再計畫、有證據才算完成）...*").catch(() => {});
+      }
+      const brief = await fetchSuperpowersBrief(text);
+      if (brief) {
+        expandedText += `\n\n--- Superpowers brief ---\n${brief}\n--- End of superpowers brief ---`;
+      }
+    } catch (err) {
+      console.error(`[discord-cc-bot] superpowers brief threw:`, err);
+    }
+  }
+
+  if (isRosterIntent(text) && !htmlIntent && !isImageGenIntent(text) && !shortVideoIntent) {
+    try {
+      if (previewState.msg) {
+        await previewState.msg.edit("⏳ *正在寫窄人設檔（四塊＋兩清單，不是新開機器人）...*").catch(() => {});
+      }
+      const brief = await fetchRosterBrief(text);
+      if (brief) {
+        expandedText += `\n\n--- Roster brief ---\n${brief}\n--- End of roster brief ---`;
+      }
+    } catch (err) {
+      console.error(`[discord-cc-bot] roster brief threw:`, err);
+    }
+  }
+
+  if (isLeadRouteIntent(text) && !htmlIntent && !isImageGenIntent(text) && !shortVideoIntent) {
+    try {
+      if (previewState.msg) {
+        await previewState.msg.edit("⏳ *正在套總管口徑（先取名，一次性不建，指到現成模式）...*").catch(() => {});
+      }
+      const brief = await fetchLeadRouteBrief(text);
+      if (brief) {
+        expandedText += `\n\n--- Lead route brief ---\n${brief}\n--- End of lead route brief ---`;
+      }
+    } catch (err) {
+      console.error(`[discord-cc-bot] lead route brief threw:`, err);
+    }
+  }
+
+  if (isAcceptIntent(text) && !htmlIntent && !isImageGenIntent(text) && !shortVideoIntent) {
+    try {
+      if (previewState.msg) {
+        await previewState.msg.edit("⏳ *正在套獨立驗收（四塊任務，不信已完成）...*").catch(() => {});
+      }
+      const brief = await fetchAcceptBrief(text);
+      if (brief) {
+        expandedText += `\n\n--- Accept brief ---\n${brief}\n--- End of accept brief ---`;
+      }
+    } catch (err) {
+      console.error(`[discord-cc-bot] accept brief threw:`, err);
+    }
+  }
+
+  if (isEvalSpecIntent(text) && !htmlIntent && !isImageGenIntent(text) && !shortVideoIntent) {
+    try {
+      if (previewState.msg) {
+        await previewState.msg.edit("⏳ *正在寫評測規格（先規格，不建 Harbor）...*").catch(() => {});
+      }
+      const brief = await fetchEvalSpecBrief(text);
+      if (brief) {
+        expandedText += `\n\n--- Eval spec brief ---\n${brief}\n--- End of eval spec brief ---`;
+      }
+    } catch (err) {
+      console.error(`[discord-cc-bot] eval spec brief threw:`, err);
+    }
+  }
+
+  if (isOrgChartIntent(text) && !htmlIntent && !isImageGenIntent(text) && !shortVideoIntent) {
+    try {
+      if (previewState.msg) {
+        await previewState.msg.edit("⏳ *正在套組織圖口徑（一次一格，執行長不交）...*").catch(() => {});
+      }
+      const brief = await fetchOrgChartBrief(text);
+      if (brief) {
+        expandedText += `\n\n--- Org chart brief ---\n${brief}\n--- End of org chart brief ---`;
+      }
+    } catch (err) {
+      console.error(`[discord-cc-bot] org chart brief threw:`, err);
+    }
+  }
+  return expandedText;
+}
+
+// --- Chunked message sending ---
+
+const DISCORD_MAX_LEN = 2000;
+const CHUNK_LEN = 1900;
+
+function splitMessage(text: string): string[] {
+  if (text.length <= CHUNK_LEN) return [text];
+
+  // Split text into atomic segments: complete code blocks + surrounding text.
+  // Code blocks are never broken across chunks.
+  const segments: string[] = [];
+  const blockRegex = /^(`{3,})\w*\n[\s\S]*?^\1\s*$/gm;
+  let lastEnd = 0;
+
+  for (const match of text.matchAll(blockRegex)) {
+    if (match.index! > lastEnd) {
+      segments.push(text.slice(lastEnd, match.index!));
+    }
+    segments.push(match[0]);
+    lastEnd = match.index! + match[0].length;
+  }
+  if (lastEnd < text.length) {
+    segments.push(text.slice(lastEnd));
+  }
+
+  // Pack segments into chunks, splitting only at segment boundaries
+  const chunks: string[] = [];
+  let current = "";
+
+  for (const seg of segments) {
+    const combined = current + seg;
+    if (combined.length <= CHUNK_LEN) {
+      current = combined;
+      continue;
+    }
+
+    // Won't fit — flush current chunk, start new one
+    if (current) chunks.push(current);
+
+    if (seg.length <= CHUNK_LEN) {
+      current = seg;
+    } else {
+      // Oversized segment — detect if it's a code block
+      const fenceMatch = seg.match(/^(`{3,})(\w*)\n/);
+      if (fenceMatch) {
+        // It's a code block — strip outer fences, split inner content, re-wrap each piece
+        const fence = fenceMatch[1];
+        const lang = fenceMatch[2];
+        const header = fence + lang + "\n";
+        const footer = "\n" + fence;
+        const closeIdx = seg.lastIndexOf("\n" + fence);
+        const body = seg.slice(header.length, closeIdx === -1 ? seg.length : closeIdx);
+        const maxBody = CHUNK_LEN - header.length - footer.length;
+        let rem = body;
+        while (rem.length > maxBody) {
+          let splitAt = rem.lastIndexOf("\n", maxBody);
+          if (splitAt < maxBody / 2) splitAt = maxBody;
+          chunks.push(header + rem.slice(0, splitAt) + footer);
+          rem = rem.slice(splitAt + (rem[splitAt] === "\n" ? 1 : 0));
+        }
+        current = header + rem + footer;
+      } else {
+        // Plain text oversized — split at newlines
+        let rem = seg;
+        while (rem.length > CHUNK_LEN) {
+          let splitAt = rem.lastIndexOf("\n", CHUNK_LEN);
+          if (splitAt < CHUNK_LEN / 2) splitAt = CHUNK_LEN;
+          chunks.push(rem.slice(0, splitAt));
+          rem = rem.slice(splitAt + (rem[splitAt] === "\n" ? 1 : 0));
+        }
+        current = rem;
+      }
+    }
+  }
+
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+async function sendChunked(
+  channel: { send: (content: string) => Promise<Message> },
+  text: string,
+  replyTo?: Message,
+): Promise<Message> {
+  const chunks = splitMessage(text);
+
+  let firstMsg: Message | undefined;
+  for (let i = 0; i < chunks.length; i++) {
+    if (i === 0 && replyTo) {
+      firstMsg = await replyTo.reply(chunks[i]);
+    } else {
+      const msg = await channel.send(chunks[i]);
+      if (i === 0) firstMsg = msg;
+    }
+  }
+  return firstMsg!;
+}
+
+// --- Auto-capture conversation turn to memory_api (EverOS-style episodic memory) ---
+// Fire-and-forget; never throws into the bot flow. Writes via ~/scripts/memory_api.py
+// (--no-reindex; QMD_Reindex cron makes it searchable later).
+function captureMemory(threadId: string, userText: string, replyText: string): void {
+  try {
+    const u = (userText || "").replace(/<@[!&]?\d+>/g, "").trim();
+    const r = (replyText || "").trim();
+    if (!u || !r) return;
+    const py = process.env.PYTHON_BIN ?? "python";
+    const script = path.join(os.homedir(), "scripts", "memory_api.py");
+    const name = `chat-${PERSONA}-${threadId}-${Date.now()}`;
+    const text = `## 使用者\n${u.slice(0, 1500)}\n\n## ${PERSONA}\n${r.slice(0, 3000)}`;
+    execFile(py, [script, "add", "--no-reindex", "--mtype", "episode",
+      "--agent", PERSONA, "--user", "charles", "--session", threadId,
+      "--name", name, "--text", text], { timeout: 30000 }, (err) => {
+      if (err) console.error("[memory-capture] failed:", err.message);
+    });
+  } catch (e) {
+    console.error("[memory-capture] error:", (e as Error).message);
+  }
+}
+
+// --- Streaming preview throttle ---
+
+const STREAM_THROTTLE_MS = 1500;
+const STREAM_MIN_DELTA = 40;
+const PREVIEW_MAX_LEN = 1900;
+
+type PreviewState = {
+  msg: Message | null;
+  lastText: string;
+  lastEditTime: number;
+  timer: NodeJS.Timeout | null;
+  pendingText: string;
+  startTime: number;
+  toolsUsed: string[];
+};
+
+function createPreviewState(): PreviewState {
+  return { msg: null, lastText: "", lastEditTime: 0, timer: null, pendingText: "", startTime: Date.now(), toolsUsed: [] };
+}
+
+function formatElapsed(startTime: number): string {
+  const elapsed = Math.round((Date.now() - startTime) / 1000);
+  const mins = Math.floor(elapsed / 60);
+  const secs = elapsed % 60;
+  return mins > 0 ? `${mins}m${secs}s` : `${secs}s`;
+}
+
+function buildStatusLine(ps: PreviewState): string {
+  const time = formatElapsed(ps.startTime);
+  const toolLine = ps.toolsUsed.length > 0
+    ? `🔧 ${ps.toolsUsed.slice(-3).join(" → ")}\n` : "";
+  return `\n\n${toolLine}⏳ *working... (${time})*`;
+}
+
+function flushPreview(ps: PreviewState): void {
+  if (!ps.msg || !ps.pendingText) return;
+  const display = ps.pendingText.slice(0, PREVIEW_MAX_LEN) + buildStatusLine(ps);
+  ps.msg.edit(display).catch(() => {});
+  ps.lastText = ps.pendingText;
+  ps.lastEditTime = Date.now();
+}
+
+function handleStreamText(ps: PreviewState, fullText: string): void {
+  ps.pendingText = fullText;
+
+  const delta = fullText.length - ps.lastText.length;
+  const elapsed = Date.now() - ps.lastEditTime;
+
+  // Not enough new content
+  if (delta < STREAM_MIN_DELTA && ps.lastEditTime > 0) {
+    if (!ps.timer) {
+      ps.timer = setTimeout(() => {
+        ps.timer = null;
+        flushPreview(ps);
+      }, STREAM_THROTTLE_MS);
+    }
+    return;
+  }
+
+  // Too soon since last edit
+  if (elapsed < STREAM_THROTTLE_MS && ps.lastEditTime > 0) {
+    if (!ps.timer) {
+      ps.timer = setTimeout(() => {
+        ps.timer = null;
+        flushPreview(ps);
+      }, STREAM_THROTTLE_MS - elapsed);
+    }
+    return;
+  }
+
+  // Enough content & time — flush immediately
+  if (ps.timer) clearTimeout(ps.timer);
+  flushPreview(ps);
+}
+
+// --- Discord ---
+
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN!;
+const DEFAULT_CWD = process.env.DEFAULT_CWD ?? process.cwd();
+const CLAUDE_BIN = process.env.CLAUDE_BIN ?? "claude";
+const GUILD_ID = process.env.GUILD_ID;
+const QA_MODEL = process.env.FRED_QA_MODEL ?? "claude-sonnet-5";
+
+// 檔案問答「乾淨腦」：CLAUDE_CONFIG_DIR 隔離(無 Iris CLAUDE.md/hooks) + 空 cwd + 讀單一檔
+async function answerAboutFile(filePath: string, question: string, sessionId: string, resume: boolean): Promise<RunResult> {
+  const prompt = `你是只針對「單一份文件」回答問題的助理，一律用繁體中文。只根據下面這個檔案的內容回答，不要引入任何其他背景、系統狀態、handoff 或記憶資訊；檔案沒提到的就說沒提到。\n檔案路徑：${filePath}\n\n問題：${question}`;
+  return runClaudeStreaming({
+    sessionId, prompt, cwd: FRED_QA_CWD, model: QA_MODEL, claudeBin: CLAUDE_BIN,
+    resume, configDir: FRED_QA_CONFIG,
+  });
+}
+
+// 在檔案 thread 裡 @bot 發問 → 乾淨腦只讀那份檔回答（多輪 --resume）
+async function handleFileQa(message: any, qa: QaEntry): Promise<void> {
+  let question = (message.content || "").replace(/<@[!&]?\d+>/g, "").trim();
+  // 語音提問：content 必為空，先轉錄再當成問題。轉不出來就中止，不放行給模型瞎猜。
+  if (!question && isVoiceMessage(message)) {
+    const notice = await message.reply("🎤 轉錄語音中…").catch(() => null);
+    const r = await transcribeVoiceAttachment(message);
+    if (!r.ok) {
+      console.error(`[discord-cc-bot] voice transcribe failed (file-qa path): ${r.note}`);
+      await notice?.edit(`⚠️ 語音轉錄失敗，已停止（未交給 Claude）：${r.note}`).catch(() => {});
+      return;
+    }
+    question = r.text;
+    console.log(`[discord-cc-bot] voice transcribed (${r.text.length} chars) ${r.note} [file-qa path]`);
+    await notice?.delete().catch(() => {});
+  }
+  if (!question) { await message.reply("要問這份材料什麼？@我 後面直接打問題就好。").catch(() => {}); return; }
+  if (running.has(qa.sessionId)) { await message.reply("這份材料上一個問題還在處理，請稍等。").catch(() => {}); return; }
+  const preview = await message.reply("⏳ 讀取這份材料回答中…");
+  try {
+    const started = (qa as any).started === true;
+    const result = await answerAboutFile(qa.file, question, qa.sessionId, started);
+    const text = (result.text || "").trim() || "（沒有產生回覆）";
+    const chunks = splitMessage(text);
+    await preview.edit(chunks[0]).catch(() => {});
+    for (let i = 1; i < chunks.length; i++) await (message.channel as any).send(chunks[i]).catch(() => {});
+    if (!started && result.exitCode === 0) saveQaEntry(message.channelId, { ...qa, started: true } as QaEntry);
+  } catch (e) {
+    await preview.edit(`⚠️ 回答失敗：${((e as Error).message || "").slice(0, 150)}`).catch(() => {});
+  }
+}
+
+// --- Scheduled "開工" cron ---
+// CRON_CHANNEL_ID: the thread/channel ID where the bot auto-posts "開工"
+// CRON_SCHEDULE: cron expression (default: 8:30 AM Asia/Taipei = "30 0 * * 1-5" UTC, weekdays only)
+const CRON_CHANNEL_ID = process.env.CRON_CHANNEL_ID ?? "";
+const CRON_SCHEDULE = process.env.CRON_SCHEDULE ?? "30 8 * * 1-5"; // Asia/Taipei local time
+
+// --- IrisBot watchdog (SelinaBot only) ---
+const IRISBOT_ENV = path.join(import.meta.dirname, "..", ".env");
+const IRISBOT_LOG = "/tmp/irisbot.log";
+const IRISBOT_CWD = path.join(import.meta.dirname, "..");
+
+// 2026-09-11：wmic 已從 Windows 11 移除（C:\Windows\System32\wbem\WMIC.exe 不存在）。
+// 原本 execFile("wmic") 失敗 → resolve(false) → 每 2 分鐘判「IrisBot 下線」並多開一隻新的
+// （實際事故：13:57 SelinaBot 重啟後 14:00/14:02/14:04 各多開一隻 IrisBot，且回報「重啟失敗」）。
+// 改用 PowerShell Get-CimInstance，輸出每行「PID|CommandLine」。
+function listNodeProcesses(): Promise<Array<{ pid: string; cmd: string }>> {
+  return new Promise((resolve) => {
+    execFile("powershell", [
+      "-NoProfile", "-Command",
+      "Get-CimInstance Win32_Process -Filter \"name='node.exe'\" | ForEach-Object { \"$($_.ProcessId)|$($_.CommandLine)\" }",
+    ], { windowsHide: true, timeout: 20000 }, (err, stdout) => {
+      if (err) { console.error("[discord-cc-bot] listNodeProcesses failed:", (err as Error).message); resolve([]); return; }
+      const out: Array<{ pid: string; cmd: string }> = [];
+      for (const line of stdout.split(/\r?\n/)) {
+        const i = line.indexOf("|");
+        if (i > 0) out.push({ pid: line.slice(0, i).trim(), cmd: line.slice(i + 1) });
+      }
+      resolve(out);
+    });
+  });
+}
+
+function isIrisBotCmd(cmd: string): boolean {
+  return (cmd.includes("--env-file=.env ") || cmd.includes('--env-file=".env"')) && !cmd.includes(".env.selina") && !cmd.includes(".env.athena");
+}
+
+// 查不到程序清單（PowerShell 本身失敗）時視為「還活著」——寧可漏救一次，也不要誤判後每 2 分鐘多開一隻。
+function isIrisBotRunning(): Promise<boolean> {
+  return listNodeProcesses().then((procs) => procs.length === 0 ? true : procs.some((p) => isIrisBotCmd(p.cmd)));
+}
+
+function startIrisBot(): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const log = fs.openSync(IRISBOT_LOG, "a");
+    const cleanEnv = { ...process.env };
+    delete cleanEnv.PERSONA;
+    delete cleanEnv.BACKEND;
+    delete cleanEnv.SYSTEM_PROMPT_FILE;
+    delete cleanEnv.GEMINI_MODEL;
+    delete cleanEnv.GEMINI_ALLOWED_MCP;
+    delete cleanEnv.GEMINI_TIMEOUT_MS;
+    delete cleanEnv.GEMINI_MAX_RETRIES;
+    delete cleanEnv.GEMINI_FALLBACK_MODEL;
+    delete cleanEnv.PERSONA_PROMPT;
+    delete cleanEnv.DISCORD_TOKEN;
+    const child = spawn(process.execPath, ["--env-file=.env", "--import=tsx", "src/index.ts"], {
+      cwd: IRISBOT_CWD,
+      stdio: ["ignore", log, log],
+      detached: true,
+      env: cleanEnv,
+    });
+    child.unref();
+    setTimeout(() => resolve(), 1500);
+    child.on("error", reject);
+  });
+}
+
+async function killAndRestartIrisBot(): Promise<boolean> {
+  // 1. Find and kill all IrisBot node processes
+  await new Promise<void>(async (resolve) => {
+    const pids = (await listNodeProcesses()).filter((p) => isIrisBotCmd(p.cmd)).map((p) => p.pid);
+    if (pids.length === 0) { resolve(); return; }
+    let done = 0;
+    for (const pid of pids) {
+      execFile("taskkill", ["/PID", pid, "/F"], () => { if (++done === pids.length) resolve(); });
+    }
+  });
+  // 2. Wait briefly then start fresh
+  await new Promise(r => setTimeout(r, 1000));
+  await startIrisBot();
+  // 3. Verify
+  await new Promise(r => setTimeout(r, 2000));
+  return isIrisBotRunning();
+}
+
+const slashCommands = [
+  new SlashCommandBuilder().setName("help").setDescription("Show available commands"),
+  new SlashCommandBuilder().setName("new").setDescription("Clear context — start a new conversation (thread only)"),
+  new SlashCommandBuilder().setName("model").setDescription("Switch Claude model")
+    .addStringOption(o => o.setName("name").setDescription("Model name (e.g. sonnet, opus, haiku)").setRequired(true)),
+  new SlashCommandBuilder().setName("cd").setDescription("Switch working directory")
+    .addStringOption(o => o.setName("path").setDescription("Absolute path to directory").setRequired(true)),
+  new SlashCommandBuilder().setName("stop").setDescription("Kill running Claude process (thread only)"),
+  new SlashCommandBuilder().setName("sessions").setDescription("List all active sessions"),
+  new SlashCommandBuilder().setName("resume-local").setDescription("Resume a local terminal Claude Code session")
+    .addStringOption(o => o.setName("session").setDescription("Session ID (auto-detect if omitted)").setRequired(false)),
+  new SlashCommandBuilder().setName("handback").setDescription("Hand session back to terminal"),
+  ...(PERSONA === "selina" ? [
+    new SlashCommandBuilder().setName("restart-iris").setDescription("重啟 IrisBot（SelinaBot 限定）"),
+    new SlashCommandBuilder().setName("selina-audit").setDescription("查 ticker 的 thesis 速查卡（SelinaBot 限定）")
+      .addStringOption(o => o.setName("ticker").setDescription("Stock ticker (e.g. VST, CCJ)").setRequired(true)),
+    new SlashCommandBuilder().setName("selina-brief").setDescription("立刻觸發 Selina 晨報"),
+    new SlashCommandBuilder().setName("selina-holdings").setDescription("7 檔持倉總覽（fv / 現價 / rating）"),
+    new SlashCommandBuilder().setName("selina-events").setDescription("列近期關鍵事件（財報 / FOMC）"),
+    new SlashCommandBuilder().setName("selina-weekly").setDescription("立刻產本週 digest（過去 7 天 handoff 摘要）"),
+    new SlashCommandBuilder().setName("selina-ask-brain").setDescription("查 Gbrain 語義記憶（歷史 thesis / 決策）")
+      .addStringOption(o => o.setName("query").setDescription("問題（英文較穩）").setRequired(true)),
+    new SlashCommandBuilder().setName("selina-debate").setDescription("自我辯論（bull/bear/risk 三角色模擬）")
+      .addStringOption(o => o.setName("topic").setDescription("辯論主題（e.g. VST 現在該加碼嗎）").setRequired(true)),
+    new SlashCommandBuilder().setName("selina-plan").setDescription("C2C 策略規劃：生成精準結構化行動計畫（S2H 格式）")
+      .addStringOption(o => o.setName("goal").setDescription("規劃目標（e.g. 檢驗 CCJ 49% 權益並更新 thesis）").setRequired(true)),
+    new SlashCommandBuilder().setName("selina-review").setDescription("C2C 獨立審查：調取真實 diff 與數據進行閉環確認")
+      .addStringOption(o => o.setName("target").setDescription("標的代號或任務 ID（e.g. CCJ 或 task_id）").setRequired(true)),
+    new SlashCommandBuilder().setName("selina-tasks").setDescription("查看 Selina C2C 任務看板與執行狀態"),
+    new SlashCommandBuilder().setName("selina-capabilities").setDescription("查看 Selina 異質模型能力矩陣與有序容錯配置"),
+    new SlashCommandBuilder().setName("selina-geo").setDescription("GEO 與 AI 能見度遙測：分析標的在主流 AI 搜尋的認知共識")
+      .addStringOption(o => o.setName("target").setDescription("標的代號或主題（e.g. VST, CCJ）").setRequired(true)),
+    new SlashCommandBuilder().setName("selina-seminar").setDescription("OpenMAIC 多智能體投研研討會：主講/質疑/營運三方攻防與反思考題")
+      .addStringOption(o => o.setName("topic").setDescription("研討標的或主題（e.g. VST, CCJ, SMR）").setRequired(true)),
+    new SlashCommandBuilder().setName("selina-adversarial-review").setDescription("可引導對抗性審查：針對特定假設或風險死角進行極限挑刺")
+      .addStringOption(o => o.setName("target").setDescription("標的代號（e.g. VST, CCJ）").setRequired(true))
+      .addStringOption(o => o.setName("focus").setDescription("質疑焦點（e.g. 質疑高估值、質疑產能擴張延宕）").setRequired(true)),
+    new SlashCommandBuilder().setName("selina-rescue").setDescription("跨線救援派工：將任務封裝為工單派發至 Iris Inbox 執行線")
+      .addStringOption(o => o.setName("goal").setDescription("救援任務目標與內容").setRequired(true))
+      .addStringOption(o => o.setName("priority").setDescription("優先級 (high, normal, low)").setRequired(false)),
+  ] : []),
+  ...(PERSONA === "athena" ? [
+    new SlashCommandBuilder().setName("athena-insight").setDescription("查閱最新一筆 Athena 實相歸檔（AthenaBot 限定）"),
+    new SlashCommandBuilder().setName("athena-forensic").setDescription("一鍵法證審計（自動抓取財報進行 TREX 降維打擊）")
+      .addStringOption(o => o.setName("ticker").setDescription("Stock ticker (e.g. TSLA, CEG)").setRequired(true)),
+    new SlashCommandBuilder().setName("athena-buddha").setDescription("佛陀模式辯證（正方敘事 vs 鋼鐵人反方）")
+      .addStringOption(o => o.setName("topic").setDescription("辯論主題").setRequired(true)),
+    new SlashCommandBuilder().setName("athena-polymarket").setDescription("查 Polymarket 事件勝率（導入 Base Rate）")
+      .addStringOption(o => o.setName("event").setDescription("事件關鍵字 (e.g. Fed Chair)").setRequired(true)),
+    new SlashCommandBuilder().setName("athena-ask-brain").setDescription("查 D:\\ai-memory、公司記憶與 Codex")
+      .addStringOption(o => o.setName("query").setDescription("查詢關鍵字").setRequired(true)),
+    new SlashCommandBuilder().setName("athena-mega").setDescription("🔥 執行全維度超級指令（耗時，自動呼叫 mega-reality-auditor）")
+      .addStringOption(o => o.setName("ticker").setDescription("Stock ticker (e.g. TSLA)").setRequired(true)),
+    new SlashCommandBuilder().setName("athena-daily-audit").setDescription("📊 執行每日持股新聞與論壇情緒巡視（自動讀取 holdings.json）"),
+    new SlashCommandBuilder().setName("athena-holdings").setDescription("真持股快照（手機一鍵，不經 Claude）"),
+    new SlashCommandBuilder().setName("athena-today").setDescription("今日開工卡（TODAY_SUMMARY）"),
+    new SlashCommandBuilder().setName("athena-scout").setDescription("最近一則開源偵察"),
+    new SlashCommandBuilder().setName("athena-status").setDescription("Athena 活著嗎／後端狀態"),
+    ...extraAthenaSlashCommands(),
+    new SlashCommandBuilder().setName("athena-swarm").setDescription("⚔️ 啟動多代理人沙盤推演 (Athena vs Selina 3 輪對抗)")
+      .addStringOption(o => o.setName("topic").setDescription("辯論主題").setRequired(true)),
+  ] : []),
+  ...(PERSONA === "iris" ? [
+    new SlashCommandBuilder().setName("iris-handoff").setDescription("拉最新 TODAY_SUMMARY handoff"),
+    new SlashCommandBuilder().setName("iris-holdings").setDescription("7 檔持倉快照（px / fv / rating）"),
+    new SlashCommandBuilder().setName("iris-status").setDescription("Iris 並發狀態（Heavy / Light / Queue）"),
+    new SlashCommandBuilder().setName("iris-recall").setDescription("查 Gbrain 語義記憶")
+      .addStringOption(o => o.setName("query").setDescription("問題").setRequired(true)),
+    new SlashCommandBuilder().setName("iris-kaigong").setDescription("開工：handoff + gbrain warm-up"),
+    new SlashCommandBuilder().setName("iris-audit").setDescription("Ticker 狀態卡（現況 + archive + 觸發導引）")
+      .addStringOption(o => o.setName("ticker").setDescription("Stock ticker (e.g. VST)").setRequired(true)),
+    new SlashCommandBuilder().setName("iris-sector").setDescription("美股 11 GICS 板塊輪動（L1 summary）"),
+    new SlashCommandBuilder().setName("iris-aaii").setDescription("AAII 散戶情緒卡（最新週四數據）"),
+    new SlashCommandBuilder().setName("iris-shuyuan").setDescription("📚 山崖書院開課（耗時數分鐘，跑完推播）")
+      .addStringOption(o => o.setName("book").setDescription("書名或關鍵字（要對得上收料庫的檔名）").setRequired(true))
+      .addBooleanOption(o => o.setName("list").setDescription("只找不開：先看有哪些候選").setRequired(false)),
+  ] : []),
+];
+
+if (!DISCORD_TOKEN && process.env.FRED_INTAKE_TEST !== "1") {
+  console.error("Missing DISCORD_TOKEN");
+  process.exit(1);
+}
+
+const threadMap = loadMap();
+
+const clientOptions = {
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.DirectMessages,
+    GatewayIntentBits.GuildMessageReactions, // 2026-08-25 每日情報回流 P3：回執表情
+  ],
+  partials: [Partials.Channel, Partials.Message, Partials.Reaction, Partials.User],
+};
+const client = PERSONA === "athena"
+  ? new SapphireClient({
+      ...clientOptions,
+      loadMessageCommandListeners: false,
+      disableMentionPrefix: true,
+      baseUserDirectory: path.join(import.meta.dirname),
+    })
+  : new Client(clientOptions);
+
+client.once(Events.ClientReady, async (c) => {
+  console.log(`[discord-cc-bot] ready as ${c.user.tag}`);
+  c.user.setStatus('online');
+  const rest = new REST().setToken(DISCORD_TOKEN);
+  try {
+    const route = GUILD_ID
+      ? Routes.applicationGuildCommands(c.user.id, GUILD_ID)
+      : Routes.applicationCommands(c.user.id);
+    await rest.put(route, {
+      body: slashCommands.map(cmd => cmd.toJSON()),
+    });
+    console.log(`[discord-cc-bot] registered ${slashCommands.length} slash commands`);
+    if (client instanceof SapphireClient) {
+      const n = await loadAthenaSapphireCommands(client);
+      console.log(`[discord-cc-bot] sapphire commands=${n}`);
+    }
+  } catch (err) {
+    console.error("[discord-cc-bot] failed to register commands:", err);
+  }
+
+  // Auto-join all active threads so we receive MessageCreate events after restart
+  try {
+    const guild = GUILD_ID ? c.guilds.cache.get(GUILD_ID) : c.guilds.cache.first();
+    if (guild) {
+      const active = await guild.channels.fetchActiveThreads();
+      let joined = 0;
+      for (const thread of active.threads.values()) {
+        if (!thread.joined) {
+          await thread.join();
+          joined++;
+        }
+      }
+      if (joined > 0) console.log(`[discord-cc-bot] auto-joined ${joined} active threads`);
+    }
+  } catch (err) {
+    console.error("[discord-cc-bot] failed to auto-join threads:", err);
+  }
+
+  // --- Scheduled "開工" cron job ---
+  // CRON_CHANNEL_ID should point to a TEXT CHANNEL (not a thread).
+  // Each day, the cron creates a new thread named "開工 YYYY-MM-DD" and runs CC inside it.
+  if (CRON_CHANNEL_ID && PERSONA !== "selina") {
+    cron.schedule(CRON_SCHEDULE, async () => {
+      const today = new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Taipei" }); // YYYY-MM-DD
+      console.log(`[discord-cc-bot] ⏰ cron triggered: 開工 ${today} → channel ${CRON_CHANNEL_ID}`);
+      try {
+        const channel = await c.channels.fetch(CRON_CHANNEL_ID);
+        if (!channel || !("threads" in channel)) {
+          console.error(`[discord-cc-bot] cron: channel ${CRON_CHANNEL_ID} not found or cannot create threads`);
+          return;
+        }
+
+        // Create a new thread for today's 開工
+        const threadName = `開工 ${today}`;
+        const thread = await (channel as any).threads.create({
+          name: threadName,
+          autoArchiveDuration: 1440, // 24 hours
+          reason: "Daily 開工 auto-created by IrisBot cron",
+        });
+        console.log(`[discord-cc-bot] ⏰ created thread: ${threadName} (${thread.id})`);
+
+        // Initialize thread entry
+        const entry = getOrCreate(threadMap, thread.id, DEFAULT_CWD);
+
+        const previewState = createPreviewState();
+        previewState.msg = await thread.send("⏰ **8:30 開工！**\n⏳ *Iris 正在讀取最新 handoff...*");
+
+        const cronOverride = applyModelOverride("開工", entry.model, thread.id);
+        const result = await runClaudeStreaming({
+          sessionId: entry.sessionId,
+          prompt: cronOverride.prompt,
+          cwd: entry.cwd,
+          model: cronOverride.model,
+          claudeBin: CLAUDE_BIN,
+          resume: false,
+          systemPrompt: SYSTEM_PROMPT,
+          callbacks: {
+            onText: (fullText) => handleStreamText(previewState, fullText),
+            onToolUse: createToolUseHandler(previewState),
+          },
+        });
+
+        if (previewState.timer) clearTimeout(previewState.timer);
+
+        entry.started = true;
+        patchSessionEntrypoint(entry.sessionId, entry.cwd);
+        saveEntry(thread.id, entry);
+
+        // Deliver final response
+        try {
+          await previewState.msg!.delete().catch(() => {});
+          const responseText = cronOverride.hint
+            ? `${cronOverride.hint}\n\n${result.text}`
+            : result.text;
+          if (responseText.length <= DISCORD_MAX_LEN) {
+            const botReply = await thread.send(responseText);
+            entry.lastBotMessageId = botReply.id;
+          } else {
+            const botReply = await sendChunked(thread, responseText);
+            entry.lastBotMessageId = botReply.id;
+          }
+          saveEntry(thread.id, entry);
+        } catch (err) {
+          console.error("[discord-cc-bot] cron reply failed:", (err as Error).message);
+        }
+
+        console.log(`[discord-cc-bot] ⏰ cron 開工 ${today} complete`);
+      } catch (err) {
+        console.error("[discord-cc-bot] cron error:", err);
+      }
+    }, { timezone: "Asia/Taipei" });
+
+    console.log(`[discord-cc-bot] ⏰ cron scheduled: "${CRON_SCHEDULE}" → channel ${CRON_CHANNEL_ID} (Asia/Taipei)`);
+  }
+
+  // --- Weekly digest (SelinaBot only, Saturday 09:00) ---
+  if (PERSONA === "selina" && CRON_CHANNEL_ID) {
+    const weeklySchedule = process.env.SELINA_WEEKLY_SCHEDULE ?? "0 9 * * 6";
+    cron.schedule(weeklySchedule, async () => {
+      try {
+        const channel = await c.channels.fetch(CRON_CHANNEL_ID);
+        if (channel && "send" in channel) {
+          const digest = buildWeeklyDigest();
+          await (channel as any).send(digest.slice(0, 2000));
+          console.log(`[discord-cc-bot] 📰 Selina weekly digest posted to ${CRON_CHANNEL_ID}`);
+        }
+      } catch (err) {
+        console.error("[discord-cc-bot] weekly digest failed:", err);
+        await dmCharlesOnError(c, (err as Error).message, "weekly digest cron");
+      }
+    }, { timezone: "Asia/Taipei" });
+    console.log(`[discord-cc-bot] 📰 Selina weekly digest scheduled: "${weeklySchedule}" (Asia/Taipei, Sat)`);
+  }
+
+  // --- Morning brief (SelinaBot only) ---
+  if (PERSONA === "selina" && CRON_CHANNEL_ID) {
+    const briefSchedule = process.env.SELINA_BRIEF_SCHEDULE ?? "30 8 * * 1-5";
+    cron.schedule(briefSchedule, async () => {
+      try {
+        const channel = await c.channels.fetch(CRON_CHANNEL_ID);
+        if (channel && "send" in channel) {
+          const brief = buildMorningBrief();
+          await (channel as any).send(brief.slice(0, 2000));
+          console.log(`[discord-cc-bot] 🌅 Selina morning brief posted to ${CRON_CHANNEL_ID}`);
+        }
+      } catch (err) {
+        console.error("[discord-cc-bot] morning brief failed:", err);
+        await dmCharlesOnError(c, (err as Error).message, "morning brief cron");
+      }
+    }, { timezone: "Asia/Taipei" });
+    console.log(`[discord-cc-bot] 🌅 Selina morning brief scheduled: "${briefSchedule}" (Asia/Taipei)`);
+  }
+
+  // --- Morning Forensic Audit (AthenaBot only) ---
+  if (PERSONA === "athena" && CRON_CHANNEL_ID) {
+    const athenaSchedule = process.env.ATHENA_AUDIT_SCHEDULE ?? "0 6 * * 2-6"; // Tuesday-Saturday 6:00 AM (after US market close)
+    cron.schedule(athenaSchedule, async () => {
+      try {
+        const channel = await c.channels.fetch(CRON_CHANNEL_ID);
+        if (!channel || !("send" in channel)) return;
+        
+        console.log(`[discord-cc-bot] 🦉 Athena morning audit triggered for ${CRON_CHANNEL_ID}`);
+        const previewMsg = await (channel as any).send("🦉 *Athena 正在執行盤後持股法證掃描...*");
+        
+        const auditPrompt = `[背景持股掃描] 這是每天盤後的自動排程。請調用 defeatbeta-api 與 sec-edgar 掃描 Charles 的核心持股清單 (例如 CEG, VST, TSLA, ASTS 等)。檢查是否有盤後發布的 8-K、內部人交易，或任何結構性惡化的財報跡象。若有異常，直接講風險與要不要動；不要用一階二階五段排比。若無異常，只需簡短報告「今日無結構性異常」。`;
+        
+        const result = await runAthenaCommand(auditPrompt, 300_000, channel.id, "System");
+
+        await previewMsg.delete().catch(() => {});
+        let finalText = result.text;
+        let actionFootnote = "";
+        if (ATHENA_EXT_ENABLED) {
+          const processed = postProcessAthenaOutput(finalText);
+          finalText = processed.cleanedText;
+          actionFootnote = formatAthenaActionFootnote(processed);
+        }
+        
+        const responseText = `🦉 **Athena 盤後實相預警**\n\n${finalText}${actionFootnote}`;
+        if (responseText.length <= DISCORD_MAX_LEN) {
+          await (channel as any).send(responseText);
+        } else {
+          await sendChunked(channel as any, responseText);
+        }
+        console.log(`[discord-cc-bot] 🦉 Athena morning audit posted to ${CRON_CHANNEL_ID}`);
+      } catch (err) {
+        console.error("[discord-cc-bot] Athena audit failed:", err);
+      }
+    }, { timezone: "Asia/Taipei" });
+    console.log(`[discord-cc-bot] 🦉 Athena morning audit scheduled: "${athenaSchedule}" (Asia/Taipei)`);
+  }
+
+  // --- IrisBot Watchdog (SelinaBot only) ---
+  if (PERSONA === "selina" && CRON_CHANNEL_ID) {
+    let watchdogBusy = false;
+    cron.schedule("*/2 * * * *", async () => {
+      if (watchdogBusy) return;
+      watchdogBusy = true;
+      try {
+        const alive = await isIrisBotRunning();
+        if (!alive) {
+          console.log("[discord-cc-bot] 🐕 watchdog: IrisBot is DOWN — restarting...");
+          const ok = await killAndRestartIrisBot();
+          // Notify in CRON_CHANNEL_ID
+          try {
+            const channel = await c.channels.fetch(CRON_CHANNEL_ID);
+            if (channel && "send" in channel) {
+              await (channel as any).send(ok
+                ? `🔄 **IrisBot 偵測到下線，已自動重啟成功！** (${new Date().toLocaleTimeString("zh-TW", { timeZone: "Asia/Taipei" })})`
+                : `⚠️ **IrisBot 下線，嘗試重啟失敗！** 請手動處理。`
+              );
+            }
+          } catch (notifyErr) {
+            console.error("[discord-cc-bot] watchdog notify failed:", notifyErr);
+          }
+        }
+      } catch (err) {
+        console.error("[discord-cc-bot] watchdog error:", err);
+      } finally {
+        watchdogBusy = false;
+      }
+    });
+    console.log("[discord-cc-bot] 🐕 IrisBot watchdog enabled (every 2 min)");
+  }
+
+  registerEarningsCard(c);
+});
+
+function athenaChatSystemPrompt(): string {
+  if (PERSONA !== "athena") return GEMINI_SYSTEM_PROMPT;
+  const curated = loadAthenaCuratedBody();
+  const extra = curated
+    ? `\n\n【策展課（對話沉澱，author=athenabot-curator）】\n${curated}`
+    : "";
+  return `${GEMINI_SYSTEM_PROMPT}\n\n${compactCompanyBrief()}${extra}`;
+}
+
+async function runAthenaCommand(
+  prompt: string,
+  timeoutMs: number,
+  channelId: string,
+  username: string,
+  previewState?: any
+): Promise<RunResult> {
+  // Phone-first: Athena chat/slash ride Grok oneshot + vault cards.
+  // Do not spawn Claude Code — that path hangs on mobile and looks dead.
+  if (BACKEND === "grok") {
+    const fullPrompt = buildGeminiPrompt({
+      systemPrompt: athenaChatSystemPrompt(),
+      history: "",
+      username,
+      userMessage: prompt,
+    });
+    return runGrokOnce({
+      prompt: fullPrompt,
+      timeoutMs,
+      callbacks: previewState ? {
+        onText: (fullText) => handleStreamText(previewState, fullText),
+      } : undefined,
+    });
+  }
+  // Slash commands stay on Claude Code ecosystem unless legacy BACKEND=gemini.
+  if (BACKEND !== "gemini") {
+    const entry = getOrCreate(threadMap, channelId, DEFAULT_CWD);
+    return runClaudeStreaming({
+      sessionId: crypto.randomUUID(),
+      prompt: prompt,
+      cwd: entry.cwd,
+      model: "sonnet", // Use Sonnet for slash commands for speed/capability
+      claudeBin: CLAUDE_BIN,
+      resume: false,
+      systemPrompt: SYSTEM_PROMPT,
+      callbacks: previewState ? {
+        onText: (fullText) => handleStreamText(previewState, fullText),
+      } : undefined,
+    });
+  } else {
+    const fullPrompt = buildGeminiPrompt({
+      systemPrompt: GEMINI_SYSTEM_PROMPT,
+      history: "",
+      username: username,
+      userMessage: prompt,
+    });
+    return runGeminiStreaming({
+      prompt: fullPrompt,
+      model: GEMINI_MODEL,
+      timeoutMs: timeoutMs,
+      callbacks: previewState ? {
+        onText: (fullText) => handleStreamText(previewState, fullText),
+      } : undefined,
+    });
+  }
+}
+
+if (PERSONA === "athena") {
+  setAthenaRuntime({
+    life,
+    caps,
+    retry: async (prompt, userId, channelId, username) => {
+      const runId = life.startRun({
+        threadId: channelId,
+        userId,
+        model: "grok-oneshot",
+        prompt,
+      });
+      try {
+        const result = await runAthenaCommand(prompt, execPolicy.timeoutMs, channelId, username);
+        const ch = await client.channels.fetch(channelId);
+        if (ch && "send" in ch) await (ch as any).send(String(result.text).slice(0, DISCORD_MAX_LEN));
+        life.finishRun(runId, {
+          status: result.exitCode === 0 ? "succeeded" : "failed",
+          exitCode: result.exitCode,
+          response: result.text,
+        });
+      } catch (err) {
+        life.finishRun(runId, { status: "failed", error: (err as Error).message });
+        throw err;
+      }
+    },
+  });
+}
+
+client.on(Events.InteractionCreate, async (interaction) => {
+  // --- Button handler ---
+  if (interaction.isButton()) {
+    const id = interaction.customId;
+    console.log(`[discord-cc-bot] button: ${id} by ${interaction.user.username}`);
+
+    // AskUserQuestion buttons: ask_<sessionId>_<answer>
+    if (PERSONA === "athena") {
+      const handled = await runDiscordxInteraction(interaction);
+      if (handled) return;
+    }
+
+    if (id.startsWith("ask_")) {
+      const parts = id.split("_");
+      const sessionId = parts[1];
+      const answer = parts.slice(2).join("_");
+      const threadId = interaction.channelId;
+      const entry = threadMap[threadId];
+
+      if (answer === "OTHER") {
+        await interaction.reply({ content: "Type your answer as a regular message:", ephemeral: true });
+        return;
+      }
+
+      await interaction.update({ content: `✅ **${answer}**`, components: [] });
+
+      // Resume claude with the answer
+      if (entry && !running.has(entry.sessionId)) {
+        const ch = interaction.channel!;
+        if (!("send" in ch)) return;
+        const previewState = createPreviewState();
+        previewState.msg = await ch.send("⏳ *Continuing...*");
+
+        try {
+          const buttonPromptRaw = `I choose: ${answer}`;
+          const buttonOverride = applyModelOverride(buttonPromptRaw, entry.model, threadId);
+          const result = await runClaudeStreaming({
+            sessionId: entry.sessionId,
+            prompt: buttonOverride.prompt,
+            cwd: entry.cwd,
+            model: buttonOverride.model,
+            claudeBin: CLAUDE_BIN,
+            resume: true,
+            systemPrompt: SYSTEM_PROMPT,
+            callbacks: {
+              onText: (fullText) => handleStreamText(previewState, fullText),
+              onToolUse: createToolUseHandler(previewState),
+            },
+          });
+
+          if (previewState.timer) clearTimeout(previewState.timer);
+
+          // Check for AskUserQuestion denials — render as Discord buttons
+          const askDenial = result.permissionDenials?.find(d => d.tool_name === "AskUserQuestion");
+          if (askDenial) {
+            await previewState.msg!.delete().catch(() => {});
+            await sendAskButtons(ch, threadId, entry, askDenial);
+            return;
+          }
+
+          await previewState.msg!.delete().catch(() => {});
+          const buttonFinalText = buttonOverride.hint
+            ? `${buttonOverride.hint}\n\n${result.text}`
+            : result.text;
+          let botReply: Message;
+          if (buttonFinalText.length <= DISCORD_MAX_LEN) {
+            botReply = await ch.send(buttonFinalText);
+          } else {
+            botReply = await sendChunked(ch, buttonFinalText);
+          }
+          entry.lastBotMessageId = botReply.id;
+          patchSessionEntrypoint(entry.sessionId, entry.cwd);
+          saveEntry(threadId, entry);
+        } catch (err) {
+          if (previewState.timer) clearTimeout(previewState.timer);
+          if (previewState.msg) await previewState.msg.edit(`Error: ${(err as Error).message}`).catch(() => {});
+        }
+      }
+      return;
+    }
+
+    // Test buttons (temporary)
+    if (id.startsWith("test_")) {
+      const choice = id.replace("test_", "");
+      console.log(`[discord-cc-bot] test button: ${choice}`);
+      await interaction.update({
+        content: `✅ **你選了：${choice}**\n\nBot 收到了你的選擇！按鈕互動成功。`,
+        components: [],
+      });
+      return;
+    }
+
+    return;
+  }
+
+  // --- Select menu handler (resume-local session picker) ---
+  if (interaction.isStringSelectMenu() && interaction.customId === "resume_local_select") {
+    const sessionId = interaction.values[0];
+    const threadId = interaction.channelId;
+    const locals = discoverLocalSessions();
+    const picked = locals.find(s => s.sessionId === sessionId);
+    const cwd = picked?.cwd ?? DEFAULT_CWD;
+    const alive = picked?.alive ?? false;
+
+    const entry = getOrCreate(threadMap, threadId, cwd);
+    entry.sessionId = sessionId;
+    entry.cwd = cwd;
+    entry.isLocalResume = true;
+    entry.started = true;
+    saveEntry(threadId, entry);
+
+    const status = alive ? "🟢 terminal still running" : "🔵 inactive";
+    await interaction.update({
+      content:
+        `📱 已接手本地 session \`${sessionId.slice(0, 8)}…\` (${status})\n` +
+        `cwd: \`${cwd}\`\n\n` +
+        (alive ? `> ⚠️ Terminal CC 還在跑。建議先在 terminal 輸入 \`/quit\`。\n` : "") +
+        `> 💻 回到 terminal 後：\`/quit\` → \`claude --continue\``,
+      components: [],
+    });
+    return;
+  }
+
+  if (!interaction.isChatInputCommand()) return;
+
+  const { commandName } = interaction;
+
+  try {
+    if (PERSONA === "athena" && SAPPHIRE_ATHENA_COMMANDS.has(commandName)) {
+      return;
+    }
+
+    if (PERSONA === "athena") {
+      const handled = await dispatchExtraAthenaCommand({
+        interaction,
+        life,
+        caps,
+        retry: async (prompt) => {
+          const ch = interaction.channel;
+          if (!ch || !("send" in ch)) return;
+          const runId = life.startRun({
+            threadId: interaction.channelId,
+            userId: interaction.user.id,
+            model: "grok-oneshot",
+            prompt,
+          });
+          try {
+            const result = await runAthenaCommand(prompt, execPolicy.timeoutMs, interaction.channelId, interaction.user.username);
+            await (ch as any).send(result.text.slice(0, DISCORD_MAX_LEN));
+            life.finishRun(runId, {
+              status: result.exitCode === 0 ? "succeeded" : "failed",
+              exitCode: result.exitCode,
+              response: result.text,
+            });
+          } catch (err) {
+            life.finishRun(runId, { status: "failed", error: (err as Error).message });
+            throw err;
+          }
+        },
+      });
+      if (handled) return;
+    }
+
+    if (commandName === "help") {
+      await interaction.reply({
+        content: PERSONA === "athena"
+          ? `${ATHENA_PHONE_HELP}\n\n${EXTRA_ATHENA_HELP}`
+          : [
+          "`/new` — clear context, start new conversation (thread only)",
+          "`/model <name>` — switch model (e.g. sonnet, opus, haiku)",
+          "`/cd <path>` — switch working directory",
+          "`/stop` — kill running task (thread only)",
+          "`/sessions` — list all sessions",
+          "`/resume-local [session]` — resume a local terminal CC session",
+          "`/handback` — hand session back to terminal",
+        ].join("\n"),
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (commandName === "new") {
+      if (!interaction.channel?.isThread()) {
+        await interaction.reply({ content: "This command only works in threads.", ephemeral: true });
+        return;
+      }
+      const threadId = interaction.channelId;
+      const entry = getOrCreate(threadMap, threadId, DEFAULT_CWD);
+      entry.sessionId = crypto.randomUUID();
+      entry.started = false;
+      saveEntry(threadId, entry);
+      await interaction.reply({ content: "Context cleared. Next message starts a new conversation.", ephemeral: true });
+      return;
+    }
+
+    if (commandName === "model") {
+      const name = interaction.options.getString("name", true);
+      if (!interaction.channel?.isThread()) {
+        await interaction.reply({ content: "This command only works in threads.", ephemeral: true });
+        return;
+      }
+      const threadId = interaction.channelId;
+      const entry = getOrCreate(threadMap, threadId, DEFAULT_CWD);
+      entry.model = name;
+      saveEntry(threadId, entry);
+      await interaction.reply({ content: `Model -> \`${name}\``, ephemeral: true });
+      return;
+    }
+
+    if (commandName === "cd") {
+      const dir = interaction.options.getString("path", true);
+      if (!fs.existsSync(dir)) {
+        await interaction.reply({ content: `Path not found: \`${dir}\``, ephemeral: true });
+        return;
+      }
+      if (isSensitivePath(dir)) {
+        await interaction.reply({ content: "這條路徑在敏感名單裡，不准切。", ephemeral: true });
+        return;
+      }
+      if (!interaction.channel?.isThread()) {
+        await interaction.reply({ content: "This command only works in threads.", ephemeral: true });
+        return;
+      }
+      const threadId = interaction.channelId;
+      const entry = getOrCreate(threadMap, threadId, DEFAULT_CWD);
+      entry.cwd = dir;
+      saveEntry(threadId, entry);
+      await interaction.reply({ content: `cwd -> \`${dir}\``, ephemeral: true });
+      return;
+    }
+
+    if (commandName === "stop") {
+      if (!interaction.channel?.isThread()) {
+        await interaction.reply({ content: "This command only works in threads.", ephemeral: true });
+        return;
+      }
+      const threadId = interaction.channelId;
+      const entry = threadMap[threadId];
+      if (entry && running.has(entry.sessionId)) {
+        running.get(entry.sessionId)!.kill("SIGTERM");
+        await interaction.reply({ content: "Stopped.", ephemeral: true });
+      } else {
+        await interaction.reply({ content: "Nothing running.", ephemeral: true });
+      }
+      return;
+    }
+
+    if (commandName === "sessions") {
+      const lines = Object.entries(threadMap).map(
+        ([tid, e]) => `<#${tid}> | ${e.model} | \`${e.cwd}\`${e.isLocalResume ? " 📱" : ""}`,
+      );
+      await interaction.reply({
+        content: lines.length ? lines.join("\n") : "No sessions.",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (commandName === "resume-local") {
+      if (!interaction.channel?.isThread()) {
+        await interaction.reply({ content: "This command only works in threads.", ephemeral: true });
+        return;
+      }
+      const threadId = interaction.channelId;
+      const explicitId = interaction.options.getString("session");
+
+      if (explicitId) {
+        // Direct resume with explicit session ID
+        const entry = getOrCreate(threadMap, threadId, DEFAULT_CWD);
+        entry.sessionId = explicitId;
+        entry.isLocalResume = true;
+        entry.started = true; // always resume mode for local sessions
+        saveEntry(threadId, entry);
+        await interaction.reply(
+          `📱 已接手本地 session \`${explicitId.slice(0, 8)}…\`\ncwd: \`${entry.cwd}\`\n\n` +
+          `> 💻 回到 terminal 後：\`/quit\` → \`claude --continue\``,
+        );
+        return;
+      }
+
+      // Auto-discover local sessions
+      const locals = discoverLocalSessions();
+      if (locals.length === 0) {
+        await interaction.reply({ content: "No local sessions found.", ephemeral: true });
+        return;
+      }
+
+      // Filter: only sessions that are NOT alive (can't resume a running session)
+      const resumable = locals.filter(s => !s.alive);
+      const aliveCount = locals.length - resumable.length;
+
+      if (resumable.length === 0) {
+        const hint = aliveCount > 0
+          ? `Found ${aliveCount} active session(s), but can't resume a running CC.\n` +
+            `請先在 terminal 輸入 \`/quit\` 退出，再回來 \`/resume-local\`。`
+          : "No local sessions found.";
+        await interaction.reply({ content: hint, ephemeral: true });
+        return;
+      }
+
+      if (resumable.length === 1) {
+        const s = resumable[0];
+        const entry = getOrCreate(threadMap, threadId, s.cwd);
+        entry.sessionId = s.sessionId;
+        entry.cwd = s.cwd;
+        entry.isLocalResume = true;
+        entry.started = true;
+        saveEntry(threadId, entry);
+        const promptHint = s.lastPrompt ? `\nLast prompt: *${s.lastPrompt.slice(0, 100)}*\n` : "\n";
+        await interaction.reply(
+          `📱 已接手本地 session \`${s.sessionId.slice(0, 8)}…\`` +
+          promptHint +
+          `cwd: \`${s.cwd}\`\n\n` +
+          (aliveCount > 0 ? `> ⚠️ 另有 ${aliveCount} 個活躍 session 無法 resume（需先在 terminal \`/quit\`）\n` : "") +
+          `> 💻 回到 terminal 後：\`claude --continue\``,
+        );
+        return;
+      }
+
+      // Multiple resumable sessions — show select menu
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId("resume_local_select")
+        .setPlaceholder("Pick a session to resume")
+        .addOptions(
+          resumable.slice(0, 10).map((s) => {
+            const ago = Math.round((Date.now() - s.mtime) / 60000);
+            const timeStr = ago < 60 ? `${ago}m` : `${Math.round(ago / 60)}h`;
+            const prompt = s.lastPrompt ?? "(no prompt)";
+            // Label: last prompt (max 100 chars, Discord limit)
+            const label = `${prompt.slice(0, 95)}`;
+            // Description: time ago + cwd
+            const project = s.cwd.split("/").slice(-2).join("/");
+            const desc = `${timeStr} ago · ${project}`;
+            return new StringSelectMenuOptionBuilder()
+              .setLabel(label.slice(0, 100) || "(empty)")
+              .setDescription(desc.slice(0, 100))
+              .setValue(s.sessionId);
+          }),
+        );
+
+      const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu);
+      await interaction.reply({ content: "Select a local session to resume:", components: [row], ephemeral: true });
+      return;
+    }
+
+    if (commandName === "handback") {
+      if (!interaction.channel?.isThread()) {
+        await interaction.reply({ content: "This command only works in threads.", ephemeral: true });
+        return;
+      }
+      const threadId = interaction.channelId;
+      const entry = threadMap[threadId];
+      if (!entry?.isLocalResume) {
+        await interaction.reply({ content: "This thread is not a resumed local session.", ephemeral: true });
+        return;
+      }
+      // Kill any running process
+      if (running.has(entry.sessionId)) {
+        running.get(entry.sessionId)!.kill("SIGTERM");
+      }
+      // Reset to a fresh bot session
+      entry.isLocalResume = false;
+      entry.sessionId = crypto.randomUUID();
+      entry.started = false;
+      saveEntry(threadId, entry);
+      await interaction.reply(
+        `💻 已交還 session。回到 terminal 輸入 \`claude --continue\` 即可看到完整對話。\n` +
+        `此 thread 已重置，下次訊息會開始新的 bot session。`,
+      );
+      return;
+    }
+
+    if (commandName === "restart-iris" && PERSONA === "selina") {
+      await interaction.deferReply();
+      try {
+        const killed = await killAndRestartIrisBot();
+        await interaction.editReply(killed
+          ? `✅ IrisBot 已重啟成功！`
+          : `⚠️ IrisBot 重啟失敗，請查看 server log。`
+        );
+      } catch (err) {
+        await interaction.editReply(`❌ 錯誤：${(err as Error).message}`);
+      }
+      return;
+    }
+
+    if (commandName === "selina-audit" && PERSONA === "selina") {
+      await interaction.deferReply();
+      try {
+        const ticker = interaction.options.getString("ticker", true);
+        const out = renderAuditTicker(ticker);
+        await interaction.editReply(out.slice(0, 2000));
+      } catch (err) {
+        await interaction.editReply(`❌ 錯誤：${(err as Error).message}`);
+      }
+      return;
+    }
+
+    if (commandName === "selina-brief" && PERSONA === "selina") {
+      await interaction.deferReply();
+      try {
+        const brief = buildMorningBrief();
+        await interaction.editReply(brief.slice(0, 2000));
+      } catch (err) {
+        await interaction.editReply(`❌ 錯誤：${(err as Error).message}`);
+      }
+      return;
+    }
+
+    if (commandName === "selina-holdings" && PERSONA === "selina") {
+      await interaction.deferReply();
+      try {
+        const out = renderHoldingsOverview();
+        await interaction.editReply(out.slice(0, 2000));
+      } catch (err) {
+        await interaction.editReply(`❌ 錯誤：${(err as Error).message}`);
+      }
+      return;
+    }
+
+    if (commandName === "selina-events" && PERSONA === "selina") {
+      await interaction.deferReply();
+      try {
+        const out = renderUpcomingEvents();
+        await interaction.editReply(out.slice(0, 2000));
+      } catch (err) {
+        await interaction.editReply(`❌ 錯誤：${(err as Error).message}`);
+      }
+      return;
+    }
+
+    if (commandName === "selina-weekly" && PERSONA === "selina") {
+      await interaction.deferReply();
+      try {
+        const out = buildWeeklyDigest();
+        await interaction.editReply(out.slice(0, 2000));
+      } catch (err) {
+        await interaction.editReply(`❌ 錯誤：${(err as Error).message}`);
+      }
+      return;
+    }
+
+    if (commandName === "selina-ask-brain" && PERSONA === "selina") {
+      await interaction.deferReply();
+      try {
+        const query = interaction.options.getString("query", true);
+        const { spawn } = await import("node:child_process");
+        const child = spawn("gbrain", ["ask", query], { shell: true });
+        let stdout = ""; let stderr = "";
+        child.stdout.on("data", (d) => { stdout += d.toString(); });
+        child.stderr.on("data", (d) => { stderr += d.toString(); });
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(() => { child.kill(); resolve(); }, 45000);
+          child.on("close", () => { clearTimeout(timer); resolve(); });
+        });
+        const output = stdout.trim() || stderr.trim() || "(no output)";
+        await interaction.editReply(`🧠 **Gbrain: ${query}**\n\n${output.slice(0, 1800)}`);
+      } catch (err) {
+        await interaction.editReply(`❌ Gbrain query 失敗：${(err as Error).message}`);
+      }
+      return;
+    }
+
+    if (commandName === "selina-debate" && PERSONA === "selina") {
+      await interaction.deferReply();
+      try {
+        const topic = interaction.options.getString("topic", true);
+        const debatePrompt = `[內部辯論模式] 針對主題「${topic}」用三個角色各一段話（每段 2-3 句，不超過 80 字）產出結構化辯論。禁止官方腔、禁止表格：
+
+🟢 **Selina Bull**：從成長/敘事/宏觀順風角度看為什麼該做/加碼。
+🔴 **Athena Bear**：從估值/財報/red flag/法證稽核角度反對。
+🟡 **Marcus Risk**：從 position sizing、停損、時機、regime 風險給實戰建議。
+
+最後一行用粗體給 **Charles 的下一步 action**（一句話，具體、可執行）。`;
+
+        // Inline call to Gemini via the existing runGeminiStreaming helper
+        const debateFullPrompt = buildGeminiPrompt({
+          systemPrompt: GEMINI_SYSTEM_PROMPT,
+          history: "",
+          username: interaction.user.username,
+          userMessage: debatePrompt,
+        });
+        const result = await runGeminiStreaming({
+          prompt: debateFullPrompt,
+          model: GEMINI_MODEL,
+          timeoutMs: 120_000,
+        });
+        await interaction.editReply(`⚔️ **自我辯論：${topic}**\n\n${result.text.slice(0, 1800)}`);
+      } catch (err) {
+        await interaction.editReply(`❌ 辯論失敗：${(err as Error).message}`);
+      }
+      return;
+    }
+
+    if (commandName === "selina-plan" && PERSONA === "selina") {
+      await interaction.deferReply();
+      try {
+        const goal = interaction.options.getString("goal", true);
+        const planPrompt = buildSelinaPlanPrompt(goal);
+        const fullPrompt = buildGeminiPrompt({
+          systemPrompt: GEMINI_SYSTEM_PROMPT,
+          history: "",
+          username: interaction.user.username,
+          userMessage: planPrompt,
+        });
+        const result = await runOneshotStreaming({
+          prompt: fullPrompt,
+          timeoutMs: 120_000,
+        });
+        const processed = postProcessSelinaOutput(result.text);
+        const footnote = formatActionFootnote(processed);
+        await interaction.editReply(`${processed.cleanedText}${footnote}`.slice(0, 2000));
+      } catch (err) {
+        await interaction.editReply(`❌ 生成計畫失敗：${(err as Error).message}`);
+      }
+      return;
+    }
+
+    if (commandName === "selina-review" && PERSONA === "selina") {
+      await interaction.deferReply();
+      try {
+        const target = interaction.options.getString("target", true);
+        const reviewText = renderSelinaReview(target);
+        await interaction.editReply(reviewText.slice(0, 2000));
+      } catch (err) {
+        await interaction.editReply(`❌ 審查執行失敗：${(err as Error).message}`);
+      }
+      return;
+    }
+
+    if (commandName === "selina-tasks" && PERSONA === "selina") {
+      await interaction.deferReply();
+      try {
+        const tasksBoard = renderRecentTasks();
+        await interaction.editReply(tasksBoard.slice(0, 2000));
+      } catch (err) {
+        await interaction.editReply(`❌ 讀取任務看板失敗：${(err as Error).message}`);
+      }
+      return;
+    }
+
+    if (commandName === "selina-capabilities" && PERSONA === "selina") {
+      await interaction.deferReply();
+      try {
+        const out = renderSelinaCapabilities();
+        await interaction.editReply(out.slice(0, 2000));
+      } catch (err) {
+        await interaction.editReply(`❌ 查詢能力矩陣失敗：${(err as Error).message}`);
+      }
+      return;
+    }
+
+    if (commandName === "selina-geo" && PERSONA === "selina") {
+      await interaction.deferReply();
+      try {
+        const target = interaction.options.getString("target", true);
+        const out = renderGeoInsight(target);
+        await interaction.editReply(out.slice(0, 2000));
+      } catch (err) {
+        await interaction.editReply(`❌ GEO 遙測失敗：${(err as Error).message}`);
+      }
+      return;
+    }
+
+    if (commandName === "selina-seminar" && PERSONA === "selina") {
+      await interaction.deferReply();
+      try {
+        const topic = interaction.options.getString("topic", true);
+        const out = renderSelinaSeminar(topic);
+        await interaction.editReply(out.slice(0, 2000));
+      } catch (err) {
+        await interaction.editReply(`❌ 研討會執行失敗：${(err as Error).message}`);
+      }
+      return;
+    }
+
+    if (commandName === "selina-adversarial-review" && PERSONA === "selina") {
+      await interaction.deferReply();
+      try {
+        const target = interaction.options.getString("target", true);
+        const focus = interaction.options.getString("focus", true);
+        const out = renderAdversarialReview(target, focus);
+        await interaction.editReply(out.slice(0, 2000));
+      } catch (err) {
+        await interaction.editReply(`❌ 對抗性審查失敗：${(err as Error).message}`);
+      }
+      return;
+    }
+
+    if (commandName === "selina-rescue" && PERSONA === "selina") {
+      await interaction.deferReply();
+      try {
+        const goal = interaction.options.getString("goal", true);
+        const priority = interaction.options.getString("priority") || "high";
+        const out = renderRescueDispatch(goal, priority);
+        await interaction.editReply(out.slice(0, 2000));
+      } catch (err) {
+        await interaction.editReply(`❌ 救援工單派發失敗：${(err as Error).message}`);
+      }
+      return;
+    }
+
+    // ─── AthenaBot /athena-* commands (PERSONA === "athena") ─────────────────
+
+    if (commandName === "athena-insight" && PERSONA === "athena") {
+      await interaction.deferReply();
+      try {
+        await interaction.editReply(renderLatestAthenaInsight());
+      } catch (err) {
+        await interaction.editReply(`❌ 錯誤：${(err as Error).message}`);
+      }
+      return;
+    }
+
+    if (commandName === "athena-holdings" && PERSONA === "athena") {
+      await interaction.deferReply();
+      try {
+        await interaction.editReply(renderAthenaHoldings());
+      } catch (err) {
+        await interaction.editReply(`讀持股失敗：${(err as Error).message}`);
+      }
+      return;
+    }
+
+    if (commandName === "athena-today" && PERSONA === "athena") {
+      await interaction.deferReply();
+      try {
+        await interaction.editReply(renderAthenaToday());
+      } catch (err) {
+        await interaction.editReply(`讀開工卡失敗：${(err as Error).message}`);
+      }
+      return;
+    }
+
+    if (commandName === "athena-scout" && PERSONA === "athena") {
+      await interaction.deferReply();
+      try {
+        await interaction.editReply(renderAthenaScout());
+      } catch (err) {
+        await interaction.editReply(`讀偵察失敗：${(err as Error).message}`);
+      }
+      return;
+    }
+
+    if (commandName === "athena-status" && PERSONA === "athena") {
+      await interaction.deferReply();
+      try {
+        await interaction.editReply(renderAthenaStatus());
+      } catch (err) {
+        await interaction.editReply(`狀態失敗：${(err as Error).message}`);
+      }
+      return;
+    }
+
+    if (commandName === "athena-forensic" && PERSONA === "athena") {
+      await interaction.deferReply();
+      try {
+        const ticker = interaction.options.getString("ticker", true);
+        const forensicPrompt = `[一鍵法證審計] 針對 ${ticker} 進行高維度法證審計。請立刻調用 defeatbeta-api 與 sec-edgar 抓取最新財報與內部人交易數據。找出財報貓膩與結構性瓶頸，直接給結論。禁止一階／二階／打水漂五段排比。不要表格。`;
+        const result = await runAthenaCommand(forensicPrompt, 180_000, interaction.channelId, interaction.user.username);
+        await interaction.editReply(`🕵️ **法證審計：${ticker}**\n\n${result.text.slice(0, 1800)}`);
+      } catch (err) {
+        await interaction.editReply(`❌ 審計失敗：${(err as Error).message}`);
+      }
+      return;
+    }
+
+    if (commandName === "athena-buddha" && PERSONA === "athena") {
+      await interaction.deferReply();
+      try {
+        const topic = interaction.options.getString("topic", true);
+        const buddhaPrompt = `[佛陀模式辯證] 針對主題「${topic}」進行辯證。強制扮演「正方敘事」與「鋼鐵人反方(Steelman Defense)」。
+正方敘事：列出為何此邏輯成立。
+鋼鐵人反方：給出最致命的結構性反駁或數據打擊。
+最終結論：給出實相與勝率評估。不要表格。`;
+        const result = await runAthenaCommand(buddhaPrompt, 120_000, interaction.channelId, interaction.user.username);
+        await interaction.editReply(`🧘 **佛陀辯證：${topic}**\n\n${result.text.slice(0, 1800)}`);
+      } catch (err) {
+        await interaction.editReply(`❌ 辯證失敗：${(err as Error).message}`);
+      }
+      return;
+    }
+
+    if (commandName === "athena-polymarket" && PERSONA === "athena") {
+      await interaction.deferReply();
+      try {
+        const event = interaction.options.getString("event", true);
+        const polyPrompt = `[Polymarket 查驗] 請調用 mcp-polymarket 查詢關於「${event}」的最新市場勝率與相關市場。根據查到的 Base Rate，給出一句高維度解讀。不要表格。`;
+        const result = await runAthenaCommand(polyPrompt, 90_000, interaction.channelId, interaction.user.username);
+        await interaction.editReply(`🎲 **Polymarket：${event}**\n\n${result.text.slice(0, 1800)}`);
+      } catch (err) {
+        await interaction.editReply(`❌ 查詢失敗：${(err as Error).message}`);
+      }
+      return;
+    }
+
+    if (commandName === "athena-ask-brain" && PERSONA === "athena") {
+      await interaction.deferReply();
+      try {
+        const query = interaction.options.getString("query", true);
+        const output = await runAthenaQmd(query);
+        await interaction.editReply(output.slice(0, 1900));
+      } catch (err) {
+        await interaction.editReply(`❌ QMD 查詢失敗：${(err as Error).message}`);
+      }
+      return;
+    }
+
+    if (commandName === "athena-mega" && PERSONA === "athena") {
+      await interaction.reply(`🔥 **開始執行全維度審計超級指令**...`);
+      const ticker = interaction.options.getString("ticker", true);
+      const megaPrompt = `查全維度實相 ${ticker}`;
+      
+      const ch = interaction.channel;
+      if (!ch || !("send" in ch)) return;
+      const previewState = createPreviewState();
+      previewState.msg = await (ch as any).send(`⏳ *Athena Mega Auditor 啟動中... (${ticker})*`);
+      
+      try {
+        const result = await runAthenaCommand(megaPrompt, 1_800_000, interaction.channelId, interaction.user.username, previewState);
+        
+        if (previewState.timer) clearTimeout(previewState.timer);
+        await previewState.msg!.delete().catch(() => {});
+        
+        let finalText = result.text;
+        let actionFootnote = "";
+        if (ATHENA_EXT_ENABLED) {
+          const processed = postProcessAthenaOutput(finalText);
+          finalText = processed.cleanedText;
+          actionFootnote = formatAthenaActionFootnote(processed);
+        }
+        const responseText = `🔥 **全維度實相審計：${ticker}**\n\n${finalText}${actionFootnote}`;
+        
+        if (responseText.length <= DISCORD_MAX_LEN) {
+          await (ch as any).send(responseText);
+        } else {
+          await sendChunked(ch as any, responseText);
+        }
+      } catch (err) {
+        if (previewState.timer) clearTimeout(previewState.timer);
+        if (previewState.msg) await previewState.msg.edit(`❌ 超級指令失敗：${(err as Error).message}`).catch(() => {});
+      }
+      return;
+    }
+
+    if (commandName === "athena-daily-audit" && PERSONA === "athena") {
+      await interaction.reply(`📊 **啟動每日持股與情緒巡視**...`);
+      const ch = interaction.channel;
+      if (!ch || !("send" in ch)) return;
+      const previewState = createPreviewState();
+      previewState.msg = await (ch as any).send(`⏳ *Athena 正在讀取 holdings.json 並進行全網巡視...*`);
+
+      try {
+        const auditPrompt = `[每日持股日報]\n${renderAthenaHoldings()}\n\n針對上面清單巡視：每檔一句最新風險／新聞鉤子，不要假裝又去讀一次檔。不要表格。不要一階二階排比。手機可讀，總長壓在 1800 字內。`;
+        const result = await runAthenaCommand(auditPrompt, 900_000, interaction.channelId, interaction.user.username, previewState);
+
+        await previewState.msg!.delete().catch(() => {});
+        let finalText = result.text;
+        let actionFootnote = "";
+        if (ATHENA_EXT_ENABLED) {
+          const processed = postProcessAthenaOutput(finalText);
+          finalText = processed.cleanedText;
+          actionFootnote = formatAthenaActionFootnote(processed);
+        }
+        const responseText = `📊 **每日持股審計報告**\n\n${finalText}${actionFootnote}`;
+        if (responseText.length <= DISCORD_MAX_LEN) await (ch as any).send(responseText);
+        else await sendChunked(ch as any, responseText);
+      } catch (err) {
+        if (previewState.msg) await previewState.msg.edit(`❌ 審計失敗：${(err as Error).message}`).catch(() => {});
+      }
+      return;
+    }
+
+    if (commandName === "athena-swarm" && PERSONA === "athena") {
+      await interaction.reply(`⚔️ **啟動多代理人沙盤推演**：${interaction.options.getString("topic")}`);
+      const topic = interaction.options.getString("topic", true);
+      const ch = interaction.channel;
+      if (!ch || !("send" in ch)) return;
+
+      const swarmThread = await (ch as any).threads.create({ name: `⚔️ Swarm: ${topic.slice(0, 50)}`, autoArchiveDuration: 60 });
+      let swarmContext = `[Swarm Debate Topic]: ${topic}\n\n`;
+
+      const rounds = [
+        { role: "Selina (多方)", prompt: `你是 Selina，請針對主題「${topic}」給出最強力的 Bull Case 敘事與宏觀支持。限制 150 字。` },
+        { role: "Athena (空方)", prompt: `你是 Athena，請針對 Selina 剛才的論點進行無情的法證打擊與 Red Flag 揭露。限制 150 字。` },
+        { role: "結論 & 勝率", prompt: `綜合以上辯論，請給出最終實相與勝率評估。限制 100 字。` }
+      ];
+
+      for (const round of rounds) {
+        const preview = await swarmThread.send(`⏳ *${round.role} 思考中...*`);
+        const roundPrompt = `${swarmContext}\n\n[本輪角色指令]\n${round.prompt}`;
+        // Slash stays on CC unless legacy BACKEND=gemini (chat oneshot engines do not take over slash)
+        const result = BACKEND !== "gemini"
+          ? await runAthenaCommand(roundPrompt, 120_000, interaction.channelId, "System")
+          : await runGeminiStreaming({
+              prompt: buildGeminiPrompt({
+                systemPrompt: GEMINI_SYSTEM_PROMPT,
+                history: swarmContext,
+                username: "System",
+                userMessage: round.prompt,
+              }),
+              model: GEMINI_MODEL,
+              timeoutMs: 120_000,
+            });
+        await preview.delete().catch(() => {});
+        await swarmThread.send(`**${round.role}**：\n${result.text}`);
+        swarmContext += `[${round.role}]: ${result.text}\n\n`;
+      }
+      return;
+    }
+
+    // ─── IrisBot /iris-* commands (PERSONA === "iris") ─────────────────
+
+    if (commandName === "iris-status" && PERSONA === "iris") {
+      await interaction.reply({ content: irisRenderStatus(), ephemeral: true });
+      return;
+    }
+
+    if (commandName === "iris-handoff" && PERSONA === "iris") {
+      await interaction.deferReply();
+      const gate = irisAcquireLight(interaction.id, "handoff");
+      if (!gate.ok) { await interaction.editReply(gate.message!); return; }
+      try {
+        await interaction.editReply(irisRenderHandoff().slice(0, 2000));
+      } catch (err) {
+        await interaction.editReply(`❌ 錯誤：${(err as Error).message}`);
+      } finally {
+        gate.release?.();
+      }
+      return;
+    }
+
+    if (commandName === "iris-holdings" && PERSONA === "iris") {
+      await interaction.deferReply();
+      const gate = irisAcquireLight(interaction.id, "holdings");
+      if (!gate.ok) { await interaction.editReply(gate.message!); return; }
+      try {
+        await interaction.editReply(irisRenderHoldings().slice(0, 2000));
+      } catch (err) {
+        await interaction.editReply(`❌ 錯誤：${(err as Error).message}`);
+      } finally {
+        gate.release?.();
+      }
+      return;
+    }
+
+    if (commandName === "iris-recall" && PERSONA === "iris") {
+      await interaction.deferReply();
+      const gate = irisAcquireLight(interaction.id, "recall");
+      if (!gate.ok) { await interaction.editReply(gate.message!); return; }
+      try {
+        const query = interaction.options.getString("query", true);
+        const out = await irisRunRecall(query);
+        await interaction.editReply(out.slice(0, 2000));
+      } catch (err) {
+        await interaction.editReply(`❌ Gbrain 失敗：${(err as Error).message}`);
+      } finally {
+        gate.release?.();
+      }
+      return;
+    }
+
+    if (commandName === "iris-kaigong" && PERSONA === "iris") {
+      await interaction.deferReply();
+      const gate = irisAcquireHeavy(interaction.id, "kaigong");
+      if (!gate.ok) { await interaction.editReply(gate.message!); return; }
+      if (gate.queued) {
+        await interaction.editReply(gate.message!);
+        await gate.waitFor;
+      }
+      try {
+        const out = await irisRunKaigong();
+        await interaction.editReply(out.slice(0, 2000));
+      } catch (err) {
+        await interaction.editReply(`❌ 開工失敗：${(err as Error).message}`);
+      } finally {
+        gate.release?.();
+      }
+      return;
+    }
+
+    if (commandName === "iris-audit" && PERSONA === "iris") {
+      await interaction.deferReply();
+      const rawTicker = interaction.options.getString("ticker", true);
+      const ticker = irisValidateTicker(rawTicker);
+      if (!ticker) { await interaction.editReply(`⚠️ ticker 格式不對：\`${rawTicker}\``); return; }
+
+      const gate = irisAcquireHeavy(interaction.id, `audit ${ticker}`, ticker);
+      if (!gate.ok) { await interaction.editReply(gate.message!); return; }
+      if (gate.queued) {
+        await interaction.editReply(gate.message!);
+        await gate.waitFor;
+      }
+      const gotLock = irisAcquireTickerLock(ticker, `audit by ${interaction.user.username}`, 15 * 60_000);
+      if (!gotLock) {
+        gate.release?.();
+        await interaction.editReply(`🔒 **${ticker}** 已被另一個 audit 鎖定（同 ticker 只准一個 audit），稍後再試`);
+        return;
+      }
+      try {
+        await interaction.editReply(irisRenderAuditStub(ticker).slice(0, 2000));
+      } catch (err) {
+        await interaction.editReply(`❌ Audit 失敗：${(err as Error).message}`);
+      } finally {
+        irisReleaseTickerLock(ticker);
+        gate.release?.();
+      }
+      return;
+    }
+
+    if (commandName === "iris-sector" && PERSONA === "iris") {
+      await interaction.deferReply();
+      const gate = irisAcquireLight(interaction.id, "sector");
+      if (!gate.ok) { await interaction.editReply(gate.message!); return; }
+      try {
+        const out = await irisRunSectorSummary();
+        await interaction.editReply(out.slice(0, 2000));
+      } catch (err) {
+        await interaction.editReply(`❌ sector 失敗：${(err as Error).message}`);
+      } finally {
+        gate.release?.();
+      }
+      return;
+    }
+
+    if (commandName === "iris-aaii" && PERSONA === "iris") {
+      await interaction.deferReply();
+      const gate = irisAcquireLight(interaction.id, "aaii");
+      if (!gate.ok) { await interaction.editReply(gate.message!); return; }
+      try {
+        await interaction.editReply(irisRenderAaii().slice(0, 2000));
+      } catch (err) {
+        await interaction.editReply(`❌ aaii 失敗：${(err as Error).message}`);
+      } finally {
+        gate.release?.();
+      }
+      return;
+    }
+
+    // 山崖書院開課：耗時數分鐘（備課＋出先考題＋寫第一堂），超過 Discord editReply 時限，
+    // 故照 athena-mega 模式——先回訊、背景跑、跑完推回同一頻道。
+    if (commandName === "iris-shuyuan" && PERSONA === "iris") {
+      const book = interaction.options.getString("book", true);
+      const listOnly = interaction.options.getBoolean("list") ?? false;
+      const script = path.join(os.homedir(), "scripts", "shuyuan_open_course.py");
+      const py = process.env.PYTHON_BIN ?? "python";
+      const args = [script, book, ...(listOnly ? ["--list-only"] : [])];
+
+      // 只找不開：秒回，不佔並發額度
+      if (listOnly) {
+        await interaction.deferReply();
+        execFile(py, args, { timeout: 60_000, env: { ...process.env, PYTHONUTF8: "1" } },
+          async (_e, stdout) => {
+            let msg = "❌ 搜尋失敗";
+            try {
+              const d = JSON.parse((stdout || "").trim().split("\n").filter(Boolean).pop()!);
+              const cs = (d.candidates ?? []) as any[];
+              msg = cs.length
+                ? `📚 **「${book}」候選 ${cs.length} 個**\n` +
+                  cs.map((c: any) => `・\`${c.source}\` ${c.title}${c.lessons != null ? `（已開 ${c.lessons} 堂）` : ""}`).join("\n")
+                : `⚠️ ${d.note ?? "找不到"}`;
+            } catch { /* keep default */ }
+            await interaction.editReply(msg.slice(0, 2000)).catch(() => {});
+          });
+        return;
+      }
+
+      // 真的開課：吃 Heavy 額度（跟 audit 同級，避免跟其他重活搶資源）
+      const gate = irisAcquireHeavy(interaction.id, `shuyuan ${book}`);
+      if (!gate.ok) { await interaction.reply(gate.message!); return; }
+      await interaction.reply(`📚 **開始開課：「${book}」**\n備課＋出先考題＋寫第一堂，約 5–20 分鐘，完成後推回本頻道。`);
+      const ch = interaction.channel;
+      execFile(py, args,
+        { timeout: 1_900_000, env: { ...process.env, PYTHONUTF8: "1" }, maxBuffer: 8 * 1024 * 1024 },
+        async (_e, stdout, stderr) => {
+          gate.release?.();
+          let msg: string;
+          try {
+            const d = JSON.parse((stdout || "").trim().split("\n").filter(Boolean).pop()!);
+            if (d.status === "ok") {
+              const quiz = (d.quiz ?? []) as string[];
+              msg = `✅ **開課完成：${d.title}**\n${d.url ? `📖 第一堂：${d.url}\n` : ""}` +
+                    (quiz.length ? `\n**先考三題**（先答再讀，這是設計）：\n` + quiz.map((q, i) => `${i + 1}. ${q}`).join("\n") : "");
+            } else if (d.status === "already_open") {
+              msg = `↩️ **${d.slug}** 這門課已經開過（${d.lessons} 堂）。${d.note ?? ""}`;
+            } else {
+              msg = `⚠️ ${d.note ?? d.status}`;
+            }
+          } catch {
+            msg = `❌ 開課失敗：${((stderr || "") || "無輸出").toString().slice(0, 300)}`;
+          }
+          await (ch as any)?.send?.(msg.slice(0, 2000)).catch(() => {});
+        });
+      return;
+    }
+  } catch (err) {
+    console.error("[discord-cc-bot] interaction error:", (err as Error).message);
+    if (!interaction.replied) {
+      await interaction.reply({ content: "An error occurred.", ephemeral: true }).catch(() => {});
+    }
+  }
+});
+
+// Auto-join newly created threads
+client.on(Events.ThreadCreate, async (thread) => {
+  if (!thread.joined) {
+    try {
+      await thread.join();
+      console.log(`[discord-cc-bot] auto-joined new thread: ${thread.name}`);
+    } catch (err) {
+      console.error(`[discord-cc-bot] failed to join thread ${thread.name}:`, err);
+    }
+  }
+});
+
+// Auto-join threads that get unarchived (user sends message in archived thread)
+client.on(Events.ThreadUpdate, async (oldThread, newThread) => {
+  if (oldThread.archived && !newThread.archived && !newThread.joined) {
+    try {
+      await newThread.join();
+      console.log(`[discord-cc-bot] auto-joined unarchived thread: ${newThread.name}`);
+    } catch (err) {
+      console.error(`[discord-cc-bot] failed to join unarchived thread ${newThread.name}:`, err);
+    }
+  }
+});
+
+// --- Engine passthrough (ADR-0028): !grok / !agy fuse, bypass CC pipeline ---
+const PASSTHROUGH_ENABLED = resolveEnabledEngines(PERSONA);
+console.log(
+  `[discord-cc-bot] passthrough engines: ${[...PASSTHROUGH_ENABLED].join(",") || "(none)"} (persona=${PERSONA})`,
+);
+
+async function handlePassthroughMessage(
+  message: Message,
+  engine: PassthroughEngine,
+  prompt: string,
+): Promise<void> {
+  if (!prompt) {
+    await message.reply(
+      `用法：\`!${engine} <你的問題>\`\n例：\`!${engine} 你好，報你的模型名\``,
+    );
+    logPassthrough(PERSONA, engine, null, false);
+    return;
+  }
+  const preview = await message.reply(`⏳ *${engine} lane 直通中…*`);
+  try {
+    ensureWorkdir(PERSONA);
+    const result = await runPassthrough(engine, prompt, { persona: PERSONA });
+    logPassthrough(PERSONA, engine, result.exitCode, result.timedOut);
+    const replyText = formatPassthroughReply(result);
+    await preview.delete().catch(() => {});
+    const chunks = chunkForDiscord(replyText, 1900);
+    for (let i = 0; i < chunks.length; i++) {
+      if (i === 0) {
+        await message.reply(chunks[i]);
+      } else if ("send" in message.channel) {
+        await message.channel.send(chunks[i]);
+      }
+    }
+  } catch (err) {
+    logPassthrough(PERSONA, engine, 1, false);
+    const msg = `🔌 ${engine} lane（直通，非 Claude）：\n❌ 例外：${(err as Error).message}`;
+    await preview.edit(msg).catch(async () => {
+      await message.reply(msg).catch(() => {});
+    });
+  }
+}
+
+function getTurnDeps(): TurnDeps {
+  return {
+    attachMaxBytes: ATTACH_MAX_BYTES,
+    attachTmpDir: ATTACH_TMP_DIR,
+    discordMaxLen: DISCORD_MAX_LEN,
+    isOneshot: IS_ONESHOT,
+    thinkingText: PERSONA === "athena" ? "收到，我在查。手機上請等我，不要連點。" : "⏳ *Thinking...*",
+    isVoiceMessage,
+    downloadAttachment,
+    transcribeVoice,
+    convertToMarkdown,
+    expandUrls: expandUrlsWithJina,
+    createPreviewState,
+    handleStreamText,
+    fetchHistory: fetchThreadHistory,
+    botId: client.user!.id,
+    runOneshot: async ({ userMessage, history, username, preview }) => {
+      let message = userMessage;
+      if (PERSONA === "athena") {
+        try {
+          const card = await maybeKnowledgeCard(userMessage);
+          if (card) message = `${card}\n\n${userMessage}`;
+        } catch (err) {
+          console.warn(`[athena-search] knowledge card skipped: ${(err as Error).message}`);
+        }
+      }
+      return runOneshotStreaming({
+        prompt: buildGeminiPrompt({
+          systemPrompt: athenaChatSystemPrompt(),
+          history,
+          username,
+          userMessage: message,
+        }),
+        callbacks: { onText: (fullText) => handleStreamText(preview, fullText) },
+      });
+    },
+    runClaude: async ({ userMessage, history, entry, threadId, preview, resume }) => {
+      const override = applyModelOverride(userMessage, entry.model, threadId);
+      if (override.emptyPrompt) {
+        return { kind: "empty-override", token: override.overrideToken ?? "!sonnet" };
+      }
+      const prompt = history ? `${history}${override.prompt}` : override.prompt;
+      const result = await runClaudeStreaming({
+        sessionId: entry.sessionId,
+        prompt,
+        cwd: entry.cwd,
+        model: override.model,
+        claudeBin: CLAUDE_BIN,
+        resume,
+        systemPrompt: entry.isLocalResume ? RESUME_SYSTEM_PROMPT : SYSTEM_PROMPT,
+        callbacks: {
+          onText: (fullText) => handleStreamText(preview, fullText),
+          onToolUse: createToolUseHandler(preview),
+        },
+      });
+      return { kind: "ok", result, hint: override.hint };
+    },
+    formatFinal: ({ result, entry, hint, isFirst }) => {
+      const disclosure = IS_ONESHOT
+        ? buildBackendDisclosure()
+        : buildBackendDisclosure({ isFirstReply: isFirst, isLocalResume: entry.isLocalResume });
+      let finalText = result.text;
+      let actionFootnote = "";
+      if (SELINA_EXT_ENABLED) {
+        const processed = postProcessSelinaOutput(finalText);
+        finalText = processed.cleanedText;
+        actionFootnote = formatActionFootnote(processed);
+        if (result.exitCode !== 0 && IS_ONESHOT) {
+          dmCharlesOnError(client, finalText, `${BACKEND} reply exit=${result.exitCode}`).catch(() => {});
+        }
+      }
+      if (ATHENA_EXT_ENABLED) {
+        const processed = postProcessAthenaOutput(finalText);
+        finalText = processed.cleanedText;
+        actionFootnote = formatAthenaActionFootnote(processed);
+      }
+      return hint ? `${hint}\n\n${disclosure}${finalText}${actionFootnote}` : `${disclosure}${finalText}${actionFootnote}`;
+    },
+    sendAskButtons,
+    sendChunked,
+    saveEntry,
+    captureMemory: (threadId, userText, replyText) => {
+      captureMemory(threadId, userText, replyText);
+      noteAthenaTurn(threadId, userText, replyText);
+    },
+    patchSession: patchSessionEntrypoint,
+    onTurnStart: ({ threadId, userId, prompt, model }) =>
+      life.startRun({ threadId, userId, model, prompt }),
+    onTurnEnd: (runId, input) => life.finishRun(runId, input),
+  };
+}
+
+async function handleAthenaVeraIntents(message: Message, text: string): Promise<boolean> {
+  const natural = parseCalendarCandidate(text);
+  if (natural) {
+    const drafted = caps.draftCalendar({
+      userId: message.author.id,
+      channelId: message.channelId,
+      summary: natural.summary,
+      start: natural.start,
+      duration: natural.durationMinutes,
+    });
+    const ids = confirmButtons("cal", drafted.draftId);
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(ids.customOk).setLabel("加入行事曆").setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId(ids.customNo).setLabel("取消").setStyle(ButtonStyle.Secondary),
+    );
+    const notice = [
+      "📅 **待確認的行事曆草稿**",
+      natural.summary,
+      `${natural.start.replace("T", " ").replace(":00+08:00", "")}（台北時間）`,
+      "按「加入行事曆」後才會寫入；草稿 15 分鐘後失效。",
+    ].join("\n");
+    await message.reply({ content: notice, components: [row] });
+    return true;
+  }
+  const cal = parseCalendarIntent(text);
+  if (cal) {
+    if (!cal.ok) {
+      await message.reply(cal.need);
+      return true;
+    }
+    const drafted = caps.draftCalendar({
+      userId: message.author.id,
+      channelId: message.channelId,
+      summary: cal.summary,
+      start: cal.start,
+    });
+    const ids = confirmButtons("cal", drafted.draftId);
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(ids.customOk).setLabel("確認寫入日曆").setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId(ids.customNo).setLabel("取消").setStyle(ButtonStyle.Secondary),
+    );
+    await message.reply({ content: drafted.preview, components: [row] });
+    return true;
+  }
+  const mail = parseMailIntent(text);
+  if (mail) {
+    if (!mail.ok) {
+      await message.reply(mail.need);
+      return true;
+    }
+    const drafted = caps.draftMail({
+      userId: message.author.id,
+      channelId: message.channelId,
+      to: mail.to,
+      subject: mail.subject,
+      text: mail.text,
+    });
+    const ids = confirmButtons("mail", drafted.draftId);
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(ids.customOk).setLabel("確認寄出").setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId(ids.customNo).setLabel("取消").setStyle(ButtonStyle.Secondary),
+    );
+    await message.reply({ content: drafted.preview, components: [row] });
+    return true;
+  }
+  return false;
+}
+
+// ─── 每日情報回流 P3：回執表情（2026-08-25，DESIGN_v1.1 §C）────────────
+// daily_nod.py 每天發一則「需要你點頭」訊息並登記 message_id→emoji→item 到
+// intel_ack.sqlite；這裡收 reaction 事件把 acked_at 寫回。獨立 DB、獨立 try，
+// 失敗只 log 不影響 bot 本體（兩條軌不共用中止點）。
+const INTEL_ACK_DB = "D:\\ai-memory\\data\\intel_ack.sqlite";
+client.on(Events.MessageReactionAdd, async (reaction, user) => {
+  try {
+    if (user.bot) return;
+    // 只認白名單使用者的點頭（回執是 Charles 的已讀量測，別人按不算）
+    if (ALLOWED_USER_IDS_CONFIGURED && !ALLOWED_USER_IDS.includes(user.id)) return;
+    const r = reaction.partial ? await reaction.fetch() : reaction;
+    const emoji = r.emoji.name ?? "";
+    const mid = r.message.id;
+    if (!fs.existsSync(INTEL_ACK_DB)) return;
+    const ackDb = new Database(INTEL_ACK_DB);
+    try {
+      const row = ackDb.prepare(
+        "SELECT id FROM ack_items WHERE message_id=? AND emoji=? AND acked_at IS NULL",
+      ).get(mid, emoji) as { id: number } | undefined;
+      if (row) {
+        ackDb.prepare("UPDATE ack_items SET acked_at=? WHERE id=?")
+          .run(new Date().toISOString(), row.id);
+        console.log(`[intel-ack] item ${row.id} acked via ${emoji} by ${user.id}`);
+      }
+    } finally {
+      ackDb.close();
+    }
+  } catch (err) {
+    console.warn(`[intel-ack] reaction handler error: ${(err as Error).message}`);
+  }
+});
+
+// 回覆脈絡（2026-09-03）：使用者「回覆某則訊息」提問時，把被回覆的原訊息帶進 prompt。
+// 修正前完全沒讀 message.reference——bot 只看到「這是什麼事件」四個字，看不到他回覆的
+// 行事曆推播，於是自行猜了一個不相干的答案（實際事故 2026-09-03 16:34）。
+async function buildReplyContext(message: any): Promise<string> {
+  try {
+    if (!message.reference?.messageId) return "";
+    const ref = await message.fetchReference();
+    const refText = (ref?.content || "").trim();
+    if (!refText) return "";
+    const author = ref.author?.bot ? `${ref.author.username}（bot）` : (ref.author?.username ?? "unknown");
+    return `【使用者正在回覆下面這則訊息，他的問題是針對這則問的，請以它為準回答】\n作者：${author}\n內容：\n${refText.slice(0, 1500)}\n【被回覆的訊息到此結束】\n\n`;
+  } catch (e) {
+    console.warn(`[discord-cc-bot] fetchReference failed: ${(e as Error).message}`);
+    return "";
+  }
+}
+
+client.on(Events.MessageCreate, async (message) => {
+  try {
+    if (message.author.bot) return;
+    // Debug: log every non-bot message received
+    console.log(`[discord-cc-bot] MSG from=${message.author.username} content="${message.content.slice(0, 80)}" mentions=${[...message.mentions.users.keys()].join(",")}`);
+
+    // 2026-09-04：法說會指令由 selina-earnings-card.ts 自己的監聽處理，
+    // 這裡要早退，否則同一則訊息會被處理兩次——實測會多吐一則
+    // 「agy 回覆（no output from agy）」（那正是把指令當成一般對話丟給 agy 的結果）。
+    if (isEarningsCommand(message.content)) return;
+
+    // ADR-0028: early intercept in threads — !grok / !agy bypass CC (no mention required)
+    if (message.channel.isThread() && PASSTHROUGH_ENABLED.size > 0) {
+      const ptContent = message.content.replace(/<@[!&]?\d+>/g, "").trim();
+      const ptMatch = parsePassthroughCommand(ptContent, PASSTHROUGH_ENABLED);
+      if (ptMatch) {
+        await handlePassthroughMessage(message, ptMatch.engine, ptMatch.prompt);
+        return;
+      }
+    }
+
+    // 收料入庫：DM 給 bot 或 #收料 頻道，有附件就自動入庫（免 @mention）。
+    // DM 是 Message Content Limited 模式的例外，附件必達 → 零 portal 零登入路徑。
+    // 2026-08-04 Charles 拍板：四隻 bot 都要能收料，且統一收在同一資料夾。
+    // 同一資料夾本來就成立——fred_intake.py 的 DEST 寫死 D:\ai-memory\knowledge\fred-shared，
+    // 且內建同內容重複偵測（回 duplicate 不重複入庫），故多 bot 共用不會打架。
+    // 原本只有 iris 能收，是「先在一隻上驗證」的過渡設計，現解除。
+    if (!message.channel.isThread()) {
+      const isDM = message.channel.isDMBased();
+      const isIntakeChannel = ((message.channel as any).name ?? "").includes(INTAKE_CHANNEL_NAME);
+      const attCount = gatherAttachments(message).length;   // 含轉傳快照
+      // ⚠️ 必須排除語音訊息：語音也帶一個 .ogg 附件，符合「私訊＋有附件」而被當成材料入庫，
+      // 然後 return——底下的語音轉錄路徑永遠走不到。實測 2026-08-04：Charles 私訊語音給
+      // IrisBot 沒有回應，只有 VeraBot 回（VeraBot 的 intakeExempt 早就排除了語音）。
+      // 語音是「使用者在對你講話」，不是「丟一份料進來」。
+      if ((isDM || isIntakeChannel) && attCount > 0 && !isVoiceMessage(message)) {
+        await handleIntakeMessage(message);
+        return;
+      }
+      // #收料 頻道收到「空內容+0附件」＝Discord 因 Message Content 未完整開啟把附件剝光了 → 給提示防靜默失敗
+      if (isIntakeChannel && attCount === 0 && (message.content ?? "").trim() === "") {
+        await message.reply("⚠️ 我收到訊息但沒拿到附件——因為 Discord 的 Message Content 權限沒完整開啟，非私訊的檔案會被剝掉。\n**最省事解法：直接把檔案私訊給我（DM），就會自動入庫。** 或到後台開啟 Message Content Intent 後這個頻道才會生效。").catch(() => {});
+        return;
+      }
+    }
+
+    const isIntakeQueryChannel = message.channelId === INTAKE_CHANNEL_ID
+      || (message.channel.isThread() && (message.channel as any).parentId === INTAKE_CHANNEL_ID);
+    const intakeQueryMatch = (message.content ?? "").match(/^查[\s　]+(.+?)\s*$/u);
+    if (isIntakeQueryChannel && intakeQueryMatch) {
+      if (ALLOWED_USER_IDS_CONFIGURED && !ALLOWED_USER_IDS.includes(message.author.id)) return;
+      await message.reply(await handleIntakeQuery(intakeQueryMatch[1].trim())).catch(() => {});
+      return;
+    }
+
+    // Respond when mentioned (in threads or regular channels)
+    // Check direct user mention, role mention (via guild member cache), or raw content fallback
+    const botId = client.user!.id;
+    const directMention = message.mentions.has(botId, { ignoreEveryone: false, ignoreRoles: true });
+    // Check if any mentioned role includes the bot as a member
+    const roleMention = message.mentions.roles.some(role => role.members?.has(botId));
+    // Fallback: check if the bot's guild member has any of the mentioned roles
+    const guildMember = message.guild?.members.cache.get(botId);
+    const roleFallback = guildMember
+      ? message.mentions.roles.some(role => guildMember.roles.cache.has(role.id))
+      : false;
+    // Also respond to @everyone and @here
+    const everyoneMention = message.mentions.everyone;
+    // DM 視同「已對 bot 說話」：私訊每則都是給 bot 的，免 @mention（收料 DM 的追問對話）
+    //
+    // 2026-08-04：語音訊息只有一段錄音、沒有文字，**不可能 @提及任何人**，原本會被上面那行擋掉。
+    // 放行範圍刻意限縮在「自己開的 thread」，不是任何 thread——本伺服器四隻 bot 共用同一批
+    // thread，放寬到任何 thread 就會變成搶答（VeraBot 收窄前正是如此）。
+    // 別人開的 thread 裡仍可用「@提及」或「回覆本 bot」觸發，功能不減。
+    const ownThreadVoice = isVoiceMessage(message) &&
+      message.channel.isThread() &&
+      (message.channel as any).ownerId === client.user?.id;
+    const homeName = process.env.ATHENA_HOME_CHANNEL_NAME ?? "Athena";
+    const channelName = ((message.channel as any).name ?? "") as string;
+    const parentName = ((message.channel as any).parent?.name ?? "") as string;
+    const homeExempt = PERSONA === "athena" && Boolean(message.guildId)
+      && (channelName.includes(homeName) || (message.channel.isThread() && parentName.includes(homeName)));
+    const isMentioned = directMention || roleMention || roleFallback || everyoneMention
+      || message.channel.isDMBased() || ownThreadVoice || homeExempt;
+    if (!isMentioned) return;
+
+    // --- 使用者授權閘（2026-08-04 加，來源：fredchu PR #1 review）---
+    //
+    // 在此之前，通過上面那行就直接開跑 agent，而 agent 是以
+    // --dangerously-skip-permissions 在 DEFAULT_CWD 執行的。也就是說：
+    // 任何看得到討論串的人 @mention 一下，或任何人私訊（本版 isDMBased 免 mention），
+    // 就能在這台機器上跑一個略過權限檢查的 agent。本版還多了多後端直通與三個人格擴充，
+    // 攻擊面比上游更大。
+    //
+    // 未設定 ALLOWED_USER_IDS 時維持原本的全開行為，不會弄壞既有部署——
+    // 但那等於沒有防護，正式對外的 bot 應該要設。
+    if (ALLOWED_USER_IDS_CONFIGURED && !ALLOWED_USER_IDS.includes(message.author.id)) {
+      console.warn(`[discord-cc-bot] 未授權使用者被擋: ${message.author.username} (${message.author.id})`);
+      return;
+    }
+
+    if (PERSONA === "athena" && !isVoiceMessage(message) && message.attachments.size === 0) {
+      const strippedIntent = message.content.replace(/<@[!&]?\d+>/g, "").trim();
+      if (strippedIntent && await handleAthenaVeraIntents(message, strippedIntent)) return;
+    }
+
+    // 檔案問答 thread：@bot 於「收料檔案 thread」→ 乾淨腦只讀那份檔回答（不走 Iris 完整脈絡，避免汙染）
+    if (PERSONA === "iris" && message.channel.isThread()) {
+      const qa = loadQaMap()[message.channelId];
+      if (qa) { await handleFileQa(message, qa); return; }
+    }
+
+    // If mentioned in a regular channel, auto-create a thread and redirect.
+    // DM 不能開 thread → 跳過，落到下方「直接處理」路徑原地回覆。
+    if (!message.channel.isThread() && !message.channel.isDMBased()) {
+      if (PERSONA === "athena" && !isVoiceMessage(message) && message.attachments.size === 0) {
+        const stripped = message.content.replace(/<@[!&]?\d+>/g, "").trim();
+        const fast = await matchAthenaPhoneIntent(stripped);
+        if (fast) {
+          if (fast.length <= DISCORD_MAX_LEN) await message.reply(fast).catch(() => {});
+          else await sendChunked(message.channel as any, fast, message).catch(() => {});
+          return;
+        }
+      }
+      try {
+        const fallbackName = PERSONA === "selina" ? "SelinaBot Chat" : PERSONA === "athena" ? "Athena 對話" : PERSONA === "bockybot" ? "BockyBot Chat" : "IrisBot Chat";
+        const content = message.content.replace(/<@[!&]?\d+>/g, "").trim() || "New chat";
+        const threadName = content.slice(0, 50) || fallbackName;
+        const replyCtx = await buildReplyContext(message);
+        const thread = await message.startThread({ name: threadName });
+        const entry = getOrCreate(threadMap, thread.id, DEFAULT_CWD);
+        console.log(`[discord-cc-bot] auto-created thread: ${threadName}`);
+
+        if (PERSONA === "athena") {
+          const q = life.checkQuota(message.author.id, Number(process.env.ATHENA_RATE_LIMIT_PER_USER_HOUR ?? 40));
+          if (!q.allowed) {
+            await thread.send(`這小時額度用完了，${new Date(q.resetAt).toLocaleTimeString("zh-TW", { timeZone: "Asia/Taipei" })} 再試。`);
+            return;
+          }
+          life.recordQuota(message.author.id);
+        }
+
+        await executeConversationTurn({
+          message,
+          content: replyCtx + content,
+          destChannel: thread,
+          threadId: thread.id,
+          entry,
+          sendMode: "send",
+          loadHistory: false,
+          resumeClaude: false,
+          deps: getTurnDeps(),
+        });
+      } catch (err) {
+        console.error("[discord-cc-bot] auto-thread error:", err);
+        await message.reply("Failed to create thread. Please use `/chat` instead.").catch(() => {});
+      }
+      return;
+    }
+
+    const content = message.content.replace(/<@[!&]?\d+>/g, "").trim();
+    const attachments = [...message.attachments.values()];
+    if (!content && attachments.length === 0) return;
+    const replyCtx = await buildReplyContext(message);
+
+    if (PERSONA === "athena" && content && attachments.length === 0 && !isVoiceMessage(message)) {
+      const fast = await matchAthenaPhoneIntent(content);
+      if (fast) {
+        if (fast.length <= DISCORD_MAX_LEN) await message.reply(fast);
+        else await sendChunked(message.channel as any, fast);
+        return;
+      }
+    }
+
+    const threadId = message.channelId;
+    const entry = getOrCreate(threadMap, threadId, DEFAULT_CWD);
+
+    if (running.has(entry.sessionId)) {
+      await message.reply("Previous task still running. Use `/stop` first.");
+      return;
+    }
+
+    if (PERSONA === "athena") {
+      const q = life.checkQuota(message.author.id, Number(process.env.ATHENA_RATE_LIMIT_PER_USER_HOUR ?? 40));
+      if (!q.allowed) {
+        await message.reply(`這小時額度用完了，${new Date(q.resetAt).toLocaleTimeString("zh-TW", { timeZone: "Asia/Taipei" })} 再試。`);
+        return;
+      }
+      life.recordQuota(message.author.id);
+    }
+
+    await executeConversationTurn({
+      message,
+      content: replyCtx + content,
+      destChannel: message.channel,
+      threadId,
+      entry,
+      sendMode: "reply",
+      loadHistory: true,
+      resumeClaude: entry.started,
+      deps: getTurnDeps(),
+    });
+  } catch (err) {
+    console.error("[discord-cc-bot] handler error:", (err as Error).message);
+  }
+});
+
+function shutdown() {
+  for (const child of running.values()) child.kill("SIGTERM");
+  db.close();
+  client.destroy();
+  process.exit(0);
+}
+
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
+
+process.on("uncaughtException", (err) => {
+  console.error(`[discord-cc-bot] FATAL uncaughtException:`, err);
+  shutdown();
+});
+process.on("unhandledRejection", (reason) => {
+  console.error(`[discord-cc-bot] unhandledRejection:`, reason);
+});
+
+if (process.env.FRED_INTAKE_TEST !== "1") client.login(DISCORD_TOKEN);

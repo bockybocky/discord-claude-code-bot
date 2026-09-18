@@ -1,0 +1,18 @@
+{
+  "last_updated": "2026-04-04",
+  "Timmy": [
+    { "name": "鋼琴課", "day_of_week": 2, "start_time": "19:00", "end_time": "20:00", "recurrence": "weekly" },
+    { "name": "國文素養班", "day_of_week": 3, "start_time": "18:30", "end_time": "21:30", "start_date": "2026-04-15", "recurrence": "weekly" },
+    { "name": "愛迪生實驗班", "day_of_week": 4, "start_time": "18:00", "end_time": "21:30", "recurrence": "weekly" },
+    { "name": "數學A班", "day_of_week": 6, "start_time": "09:00", "end_time": "12:30", "recurrence": "weekly" },
+    { "name": "生物進度班", "day_of_week": 6, "start_time": "14:30", "end_time": "17:30", "recurrence": "weekly" },
+    { "name": "超級生物班", "day_of_week": 0, "start_time": "18:00", "end_time": "21:30", "start_date": "2026-04-12", "recurrence": "weekly" },
+    { "name": "生物密集B班", "day_of_week": null, "start_time": null, "end_time": null, "notes": "待確認時間", "recurrence": "unknown" }
+  ],
+  "Ollie": [
+    { "name": "復健課", "day_of_week": 3, "start_time": "19:30", "end_time": "20:00", "recurrence": "weekly" },
+    { "name": "復健課", "day_of_week": 5, "start_time": "19:30", "end_time": "20:00", "recurrence": "weekly" },
+    { "name": "泰拳課", "day_of_week": 0, "start_time": "16:00", "end_time": "17:00", "recurrence": "weekly", "exceptions": [{"date": "2026-04-04", "start_time": "16:00", "end_time": "17:00", "note": "調課：由 4/5 提前至 4/4"}] },
+    { "name": "班親會", "date": "2026-04-08", "start_time": "18:40", "recurrence": "none" }
+  ]
+}

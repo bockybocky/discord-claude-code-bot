@@ -1,0 +1,60 @@
+# Dependencies
+node_modules/
+
+# Build
+dist/
+
+# Environment
+.env
+
+# Runtime state
+thread-map.json
+thread-map.json.bak
+threads.db
+threads.db-wal
+threads.db-shm
+# tmp-attachments/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Linux
+*~
+.directory
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+npm-debug.log*
+.gstack/
+fred_qa_threads.json
+
+# 2026-08-04：.env.* 一律不進版控（原本只擋 bare .env，三個含 token 的變體是被追蹤的）
+.env.*
+!.env.example
+
+# 2026-08-04：執行狀態檔與人格設定不進版控
+*.db
+*.db-shm
+*.db-wal
+selina_prompt.txt
+
+# 2026-09-18：私有備份 repo 前補排除（Discord 附件含私人圖片、快取、紀錄檔）
+tmp-attachments/
+__pycache__/
+*.pyc
+*.log.alt

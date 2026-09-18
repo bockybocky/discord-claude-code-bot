@@ -1,0 +1,12 @@
+#!/bin/bash
+# 殺掉所有舊的 SelinaBot 進程 (依賴 .env.selina 參數來識別，不會誤殺 IrisBot)
+for pid in $(wmic process where "name='node.exe'" get ProcessId,CommandLine 2>/dev/null | grep "\.env\.selina" | awk '{print $NF}'); do
+  taskkill //PID $pid //F 2>/dev/null
+done
+
+# 啟動 SelinaBot 於背景
+cd "$(dirname "$0")"
+nohup node --env-file=.env.selina --import=tsx src/index.ts > selina_out.log 2> selina_err.log < /dev/null &
+
+echo "SelinaBot is starting in the background..."
+echo "Logs are saved to selina_out.log and selina_err.log"

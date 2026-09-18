@@ -1,0 +1,209 @@
+/**
+ * One-shot CLI backends for ADR-0029 (BACKEND=grok | agy).
+ * Mirrors runGeminiOnce shape: prompt in → text/exitCode out; kill only own child on timeout.
+ */
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import { spawn, type ChildProcess } from "node:child_process";
+
+export type OneshotResult = { text: string; exitCode: number };
+
+export type OneshotCallbacks = {
+  onText?: (fullText: string) => void;
+};
+
+const GROK_BIN =
+  process.env.GROK_BIN ??
+  process.env.PASSTHROUGH_GROK_BIN ??
+  "C:\\Users\\Charles\\.grok\\bin\\grok";
+const AGY_BIN =
+  process.env.AGY_BIN ??
+  process.env.PASSTHROUGH_AGY_BIN ??
+  "C:\\Users\\Charles\\AppData\\Local\\agy\\bin\\agy";
+const GROK_MODEL =
+  process.env.GROK_MODEL ?? process.env.PASSTHROUGH_GROK_MODEL ?? "grok-4.6";
+
+/** agy CLI arg length safety — truncate old history, keep persona prefix + newest tail. */
+export const AGY_PROMPT_MAX = 6000;
+
+function defaultTimeoutMs(): number {
+  return Number(process.env.GEMINI_TIMEOUT_MS ?? 300_000);
+}
+
+function resolveCliBin(bin: string): string {
+  if (bin.endsWith(".exe") || process.platform !== "win32") return bin;
+  return `${bin}.exe`;
+}
+
+/**
+ * 截舊留新：保留 [System: …] 人格前置 + 字串尾端（最近歷史／Current Message）。
+ */
+export function truncateAgyPrompt(prompt: string, maxLen = AGY_PROMPT_MAX): string {
+  if (prompt.length <= maxLen) return prompt;
+  const sysMatch = prompt.match(/^(\[System:[\s\S]*?\])(?:\n\n|$)/);
+  const head = sysMatch ? sysMatch[0] : "";
+  const body = prompt.slice(head.length);
+  const budget = maxLen - head.length;
+  if (budget <= 0) return prompt.slice(-maxLen);
+  if (body.length <= budget) return prompt;
+  return head + body.slice(-budget);
+}
+
+function spawnOnce(opts: {
+  command: string;
+  args: string[];
+  timeoutMs: number;
+  callbacks?: OneshotCallbacks;
+  label: string;
+  cleanup?: () => void;
+  env?: NodeJS.ProcessEnv;
+  stdinFile?: string;
+}): Promise<OneshotResult> {
+  return new Promise((resolve, reject) => {
+    let child: ChildProcess;
+    let stdinFd: number | undefined;
+    try {
+      const stdin = opts.stdinFile
+        ? (stdinFd = fs.openSync(opts.stdinFile, "r"))
+        : "ignore";
+      child = spawn(opts.command, opts.args, {
+        stdio: [stdin, "pipe", "pipe"],
+        windowsHide: true,
+        shell: false,
+        env: opts.env,
+      });
+    } catch (err) {
+      if (stdinFd !== undefined) {
+        try {
+          fs.closeSync(stdinFd);
+        } catch {
+          /* ignore */
+        }
+      }
+      opts.cleanup?.();
+      reject(err);
+      return;
+    }
+
+    let stdout = "";
+    let settled = false;
+
+    child.stdout?.on("data", (chunk: Buffer) => {
+      const text = chunk.toString();
+      stdout += text;
+      opts.callbacks?.onText?.(stdout);
+    });
+    child.stderr?.on("data", (chunk: Buffer) => {
+      console.error(`[${opts.label}-stderr] ${chunk.toString().trim()}`);
+    });
+
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      // Kill only this spawn — no global taskkill
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        /* ignore */
+      }
+      setTimeout(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          /* ignore */
+        }
+      }, 5000);
+      opts.cleanup?.();
+      const partial = stdout.trim();
+      if (partial) {
+        resolve({
+          text: partial + `\n\n⚠️ *${opts.label} timed out — partial result above.*`,
+          exitCode: 124,
+        });
+      } else {
+        resolve({
+          text: `⚠️ ${opts.label} 目前沒有回應，請稍後再試。`,
+          exitCode: 124,
+        });
+      }
+    }, opts.timeoutMs);
+
+    child.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      opts.cleanup?.();
+      reject(err);
+    });
+
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      opts.cleanup?.();
+      const text = stdout.trim() || `(no output from ${opts.label})`;
+      resolve({ text, exitCode: code ?? 1 });
+    });
+  });
+}
+
+/** grok oneshot: company grok_call.py (proxy then API). CLI headless hangs. */
+export function runGrokOnce(opts: {
+  prompt: string;
+  timeoutMs?: number;
+  callbacks?: OneshotCallbacks;
+}): Promise<OneshotResult> {
+  const timeoutMs = opts.timeoutMs ?? defaultTimeoutMs();
+  const tmpFile = path.join(
+    os.tmpdir(),
+    `discord-cc-bot-grok-${Date.now()}-${process.pid}.txt`,
+  );
+  fs.writeFileSync(tmpFile, opts.prompt, "utf8");
+  const timeoutSec = Math.max(30, Math.floor(timeoutMs / 1000));
+  // 2026-08-14: `grok --prompt-file` 120s+ empty stdout/stderr on this
+  // machine (Discord then shows「目前沒有回應」). grok_call.py is the
+  // working oneshot path; --x-search lets it read X links.
+  return spawnOnce({
+    command: "python",
+    args: [
+      "C:\\Users\\Charles\\scripts\\grok_call.py",
+      "回覆下列 Discord 對話。一律繁體中文，禁簡體。",
+      "--timeout",
+      String(timeoutSec),
+      "--model",
+      GROK_MODEL,
+      "--api",
+      "--x-search",
+    ],
+    timeoutMs,
+    callbacks: opts.callbacks,
+    label: "grok",
+    stdinFile: tmpFile,
+    cleanup: () => {
+      try {
+        fs.unlinkSync(tmpFile);
+      } catch {
+        /* ignore */
+      }
+    },
+  });
+}
+
+/** agy headless: `agy --print <prompt>` (truncate >6000, keep system + newest). */
+export function runAgyOnce(opts: {
+  prompt: string;
+  timeoutMs?: number;
+  callbacks?: OneshotCallbacks;
+}): Promise<OneshotResult> {
+  const timeoutMs = opts.timeoutMs ?? defaultTimeoutMs();
+  const finalPrompt = truncateAgyPrompt(opts.prompt);
+  const bin = resolveCliBin(AGY_BIN);
+  return spawnOnce({
+    command: bin,
+    args: ["--print", finalPrompt],
+    timeoutMs,
+    callbacks: opts.callbacks,
+    label: "agy",
+  });
+}

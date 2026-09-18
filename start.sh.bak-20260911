@@ -1,0 +1,7 @@
+#!/bin/bash
+# 殺掉所有舊的 bot 進程 (IrisBot)
+for pid in $(wmic process where "name='node.exe'" get ProcessId,CommandLine 2>/dev/null | grep "index.ts" | grep -v "selina" | awk '{print $NF}'); do
+  taskkill //PID $pid //F 2>/dev/null
+done
+# 啟動
+cd "$(dirname "$0")" && npm start

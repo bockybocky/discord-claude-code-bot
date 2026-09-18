@@ -1,0 +1,278 @@
+/**
+ * IrisBot extensions — v0.1.
+ *
+ * Implements 8 /iris-* slash commands per
+ *   ~/.agents/iris/iris_slash_commands_spec.md
+ *
+ * Light (direct read/spawn, <30s):
+ *   /iris-handoff   — pull latest TODAY_SUMMARY
+ *   /iris-holdings  — 7-ticker snapshot from thesis frontmatter
+ *   /iris-status    — concurrency state
+ *   /iris-recall    — gbrain ask
+ *   /iris-sector    — stub (wraps us_sector_rotation script, v0.2)
+ *   /iris-aaii      — stub (wraps aaii fetcher, v0.2)
+ *
+ * Light-medium:
+ *   /iris-kaigong   — handoff + gbrain warm-up composite
+ *
+ * Heavy:
+ *   /iris-audit <T> — stub for v0.1 (spawns mega-reality-auditor in v0.2)
+ */
+import fs from "fs";
+import path from "path";
+import os from "os";
+import { spawn } from "child_process";
+
+const HOME = os.homedir();
+// Canonical vault is D:\ai-memory (not ~/ai-memory — that path is only a junction).
+const AI_MEMORY = process.env.AI_MEMORY_ROOT ?? "D:\\ai-memory";
+const HANDOFF_DIR = path.join(AI_MEMORY, "core");
+const THESIS_DIR = path.join(AI_MEMORY, "research", "companies");
+
+const HOLDINGS = ["BWXT", "CCJ", "CEG", "VST", "ASTS", "PLTR", "NET"];
+const TICKER_RE = /^[A-Z0-9.]{1,8}$/;
+
+// ─── /iris-handoff ───────────────────────────────────────────────────────
+
+export function renderHandoff(): string {
+  try {
+    const files = fs.readdirSync(HANDOFF_DIR)
+      .filter(f => /^TODAY_SUMMARY_\d+\.md$/.test(f))
+      .sort();
+    if (files.length === 0) {
+      return `📭 **找不到 handoff 檔**\n\n\`${HANDOFF_DIR}\` 下沒有 TODAY_SUMMARY_*.md，可能 session-handoff 還沒跑。`;
+    }
+    const latest = files[files.length - 1];
+    const text = fs.readFileSync(path.join(HANDOFF_DIR, latest), "utf-8");
+    const preview = text.length > 1700 ? text.slice(0, 1700) + "\n\n*…(truncated)*" : text;
+    return `📄 **最新 handoff — ${latest}**\n\n${preview}`;
+  } catch (err) {
+    return `⚠️ 讀 handoff 失敗：${(err as Error).message}`;
+  }
+}
+
+// ─── /iris-holdings ──────────────────────────────────────────────────────
+
+export function renderHoldings(): string {
+  const rows: string[] = [];
+  for (const t of HOLDINGS) {
+    const p = path.join(THESIS_DIR, t, "thesis.md");
+    if (!fs.existsSync(p)) { rows.push(`• **${t}** — *(thesis missing)*`); continue; }
+    try {
+      const raw = fs.readFileSync(p, "utf-8");
+      const fm = raw.match(/^---\n([\s\S]*?)\n---/);
+      if (!fm) { rows.push(`• **${t}** — *(no frontmatter)*`); continue; }
+      const pick = (k: string) => fm[1].match(new RegExp(`^${k}:\\s*(.+)$`, "m"))?.[1]?.trim() ?? "?";
+      const fv = pick("fair_value");
+      const cp = pick("current_price");
+      const rating = pick("rating");
+      const lu = pick("last_updated");
+      rows.push(`• **${t}** — px **${cp}** / fv **${fv}** / rating **${rating}** · ${lu}`);
+    } catch {
+      rows.push(`• **${t}** — *(read error)*`);
+    }
+  }
+  const stamp = new Date().toLocaleString("zh-TW", { timeZone: "Asia/Taipei" });
+  return `📦 **Iris 持倉快照**（${stamp}）\n\n${rows.join("\n")}\n\n*source: \`ai-memory/research/companies/{T}/thesis.md\` frontmatter*`;
+}
+
+// ─── /iris-recall ────────────────────────────────────────────────────────
+
+export async function runRecall(query: string, timeoutMs = 45_000): Promise<string> {
+  return new Promise((resolve) => {
+    const child = spawn("gbrain", ["ask", query], { shell: true });
+    let stdout = ""; let stderr = "";
+    child.stdout.on("data", d => { stdout += d.toString(); });
+    child.stderr.on("data", d => { stderr += d.toString(); });
+    const timer = setTimeout(() => { child.kill(); resolve(`⏱️ Gbrain 超時（${timeoutMs / 1000}s）`); }, timeoutMs);
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0 && stdout.trim()) {
+        const out = stdout.trim().slice(0, 1700);
+        resolve(`🧠 **Gbrain: ${query}**\n\n${out}`);
+      } else {
+        const err = (stderr || stdout || "(no output)").trim().slice(0, 1500);
+        resolve(`⚠️ Gbrain 查詢失敗（exit ${code}）\n\`\`\`\n${err}\n\`\`\``);
+      }
+    });
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      resolve(`⚠️ Gbrain 啟動失敗：${err.message}（確認 gbrain CLI 在 PATH）`);
+    });
+  });
+}
+
+// ─── /iris-kaigong ───────────────────────────────────────────────────────
+
+export async function runKaigong(): Promise<string> {
+  // 1. Latest handoff preview
+  let handoffSection = "";
+  try {
+    const files = fs.readdirSync(HANDOFF_DIR)
+      .filter(f => /^TODAY_SUMMARY_\d+\.md$/.test(f))
+      .sort();
+    if (files.length > 0) {
+      const latest = files[files.length - 1];
+      const text = fs.readFileSync(path.join(HANDOFF_DIR, latest), "utf-8");
+      const m = text.match(/^###?\s*待續工作[\s\S]*?(?=^##|^###\s|\Z)/m);
+      const snippet = m ? m[0].trim() : text.slice(0, 600);
+      handoffSection = `## 📄 今日狀態（source: ${latest}）\n\n${snippet.slice(0, 900)}`;
+    } else {
+      handoffSection = `## 📄 今日狀態\n\n*(無 TODAY_SUMMARY — 跑 /session-handoff 先)*`;
+    }
+  } catch (err) {
+    handoffSection = `## 📄 今日狀態\n\n⚠️ ${(err as Error).message}`;
+  }
+
+  // 2. Gbrain warm-up (持倉風險 + 宏觀 + 急迫 action)
+  let gbrainSection = "";
+  try {
+    const q = "今日持倉最大風險 + 最新宏觀象限 + 急迫 action";
+    const result = await runRecall(q, 30_000);
+    // Strip the leading "🧠 **Gbrain: ...**\n\n" if present
+    const clean = result.replace(/^🧠\s*\*\*Gbrain:.*?\*\*\s*\n+/, "");
+    gbrainSection = `## 🧠 Gbrain 語義補充\n\n${clean.slice(0, 700)}`;
+  } catch (err) {
+    gbrainSection = `## 🧠 Gbrain 語義補充\n\n⚠️ ${(err as Error).message}`;
+  }
+
+  const stamp = new Date().toLocaleString("zh-TW", { timeZone: "Asia/Taipei" });
+  return `🚀 **開工（${stamp}）**\n\n${handoffSection}\n\n${gbrainSection}\n\n---\n*下一步想從哪開始？*`;
+}
+
+// ─── /iris-audit (stub v0.1) ─────────────────────────────────────────────
+
+export function validateTicker(raw: string): string | null {
+  const upper = raw.trim().toUpperCase();
+  return TICKER_RE.test(upper) ? upper : null;
+}
+
+export function renderAuditStub(ticker: string): string {
+  const upper = validateTicker(ticker);
+  if (!upper) return `⚠️ ticker 格式不對：\`${ticker}\``;
+  const thesisPath = path.join(THESIS_DIR, upper, "thesis.md");
+  const exists = fs.existsSync(thesisPath);
+  const archiveDir = path.join(THESIS_DIR, upper, "archive");
+  let lastAudit = "(無歷史)";
+  if (fs.existsSync(archiveDir)) {
+    try {
+      const files = fs.readdirSync(archiveDir).filter(f => f.endsWith(".md")).sort();
+      if (files.length > 0) lastAudit = files[files.length - 1];
+    } catch { /* ignore */ }
+  }
+  let fvBlock = "";
+  if (exists) {
+    try {
+      const raw = fs.readFileSync(thesisPath, "utf-8");
+      const fm = raw.match(/^---\n([\s\S]*?)\n---/);
+      if (fm) {
+        const pick = (k: string) => fm[1].match(new RegExp(`^${k}:\\s*(.+)$`, "m"))?.[1]?.trim() ?? "?";
+        fvBlock = `\n• 現有 thesis：px **${pick("current_price")}** / fv **${pick("fair_value")}** / rating **${pick("rating")}** · ${pick("last_updated")}`;
+      }
+    } catch { /* ignore */ }
+  }
+  return [
+    `🧪 **/iris-audit ${upper}**`,
+    ``,
+    `目前狀態：`,
+    `• thesis.md：${exists ? "✅ 存在" : "❌ 不存在（新 ticker）"}${fvBlock}`,
+    `• 最近一次 archive：${lastAudit}`,
+    `• Heavy concurrency gate / ticker lock：已就位`,
+    ``,
+    `⚠️ **v0.2 限制**：mega-reality-auditor 是 Claude skill，需透過 Claude session 執行（5-15 分鐘 + 吃 tokens）。`,
+    ``,
+    `**現行觸發方式**：在 thread 內 @Iris 說「查全維度實相 ${upper}」或「mega audit ${upper}」，Iris 會跑完整 5 個子審計並 in-place 更新 thesis.md。`,
+    ``,
+    `v0.3 計畫：slash 指令直接 spawn \`claude -p\` 背景跑，完成後 push 回本頻道。`,
+  ].join("\n");
+}
+
+// ─── /iris-sector ────────────────────────────────────────────────────────
+
+const SECTOR_SCRIPT = path.join(HOME, "scripts", "sector_rotation.py");
+
+export async function runSectorSummary(timeoutMs = 60_000): Promise<string> {
+  if (!fs.existsSync(SECTOR_SCRIPT)) {
+    return `⚠️ 找不到 \`${SECTOR_SCRIPT}\`，無法執行 sector rotation。`;
+  }
+  return new Promise((resolve) => {
+    const child = spawn("python", [SECTOR_SCRIPT, "--summary"], { shell: true });
+    let stdout = ""; let stderr = "";
+    child.stdout.on("data", d => { stdout += d.toString(); });
+    child.stderr.on("data", d => { stderr += d.toString(); });
+    const timer = setTimeout(() => { child.kill(); resolve(`⏱️ sector_rotation 超時（${timeoutMs / 1000}s）`); }, timeoutMs);
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0 && stdout.trim()) {
+        const out = stdout.trim();
+        const header = `📊 **美股板塊輪動（11 GICS，L1）**\n*source: scripts/sector_rotation.py --summary*\n\n`;
+        const body = out.length > 1700 ? out.slice(0, 1700) + "\n\n*…(truncated, 跑 L2/L3 用 /iris-sector --full 待 v0.3)*" : out;
+        resolve(header + body);
+      } else {
+        const err = (stderr || stdout || "(no output)").trim().slice(0, 1500);
+        resolve(`⚠️ sector_rotation 失敗（exit ${code}）\n\`\`\`\n${err}\n\`\`\``);
+      }
+    });
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      resolve(`⚠️ 啟動失敗：${err.message}`);
+    });
+  });
+}
+
+// ─── /iris-aaii ──────────────────────────────────────────────────────────
+
+const AAII_JSON = path.join(AI_MEMORY, "data", "aaii_history.json");
+
+interface AaiiRow {
+  date: string;
+  bullish: number | null;
+  neutral: number | null;
+  bearish: number | null;
+}
+
+export function renderAaii(): string {
+  if (!fs.existsSync(AAII_JSON)) {
+    return `⚠️ 找不到 \`${AAII_JSON}\`，AAII 歷史檔未就位。`;
+  }
+  let rows: AaiiRow[];
+  try {
+    rows = JSON.parse(fs.readFileSync(AAII_JSON, "utf-8")) as AaiiRow[];
+  } catch (err) {
+    return `⚠️ AAII JSON 解析失敗：${(err as Error).message}`;
+  }
+  const complete = rows.filter(r => r.bullish != null && r.neutral != null && r.bearish != null);
+  if (complete.length === 0) return `⚠️ AAII 歷史檔無完整資料列`;
+  const latest = complete[complete.length - 1];
+  const spread = (latest.bullish! - latest.bearish!).toFixed(1);
+  const lastN = complete.slice(-9, -1); // last 8 weeks before current
+  const avgBull = lastN.length > 0 ? lastN.reduce((s, r) => s + r.bullish!, 0) / lastN.length : latest.bullish!;
+  const avgBear = lastN.length > 0 ? lastN.reduce((s, r) => s + r.bearish!, 0) / lastN.length : latest.bearish!;
+  const bullDelta = (latest.bullish! - avgBull).toFixed(1);
+  const bearDelta = (latest.bearish! - avgBear).toFixed(1);
+
+  let regime = "🟡 中性";
+  if (latest.bullish! >= 40) regime = "🟢 偏多過熱";
+  else if (latest.bullish! <= 20) regime = "🔴 極悲觀";
+  else if (latest.bearish! >= 45) regime = "🔴 恐慌偏高";
+  else if (latest.bearish! <= 20) regime = "🟢 樂觀";
+
+  const extreme = Number(spread) <= -15 ? " ⚠️ **Bull-Bear <-15 極悲觀**" :
+                  Number(spread) >= 25 ? " ⚠️ **Bull-Bear >25 過熱**" : "";
+
+  return [
+    `📈 **AAII 散戶情緒（${latest.date}）**`,
+    ``,
+    `| 指標 | 本週 | 8W avg | Δ |`,
+    `|------|------|--------|---|`,
+    `| Bullish | **${latest.bullish}%** | ${avgBull.toFixed(1)}% | ${Number(bullDelta) >= 0 ? "+" : ""}${bullDelta} |`,
+    `| Neutral | ${latest.neutral}% | — | — |`,
+    `| Bearish | **${latest.bearish}%** | ${avgBear.toFixed(1)}% | ${Number(bearDelta) >= 0 ? "+" : ""}${bearDelta} |`,
+    `| Spread (Bull-Bear) | **${spread}** | — | — |`,
+    ``,
+    `**情緒 regime**：${regime}${extreme}`,
+    ``,
+    `*source: D:/ai-memory/data/aaii_history.json（${complete.length} 筆完整歷史）*`,
+    `*資料更新節奏：每週四 AAII 官方發布*`,
+  ].join("\n");
+}
