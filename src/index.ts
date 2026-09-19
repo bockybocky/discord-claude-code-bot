@@ -1297,7 +1297,12 @@ export function matchIntakeTickers(text: string, tickers: string[]): string[] {
   for (const rawTicker of tickers) {
     const ticker = rawTicker.trim().toUpperCase();
     if (!ticker || seen.has(ticker)) continue;
-    const pattern = new RegExp(`(?<![A-Za-z0-9])${ticker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![A-Za-z0-9])`, "i");
+    // 2026-09-19: 大小寫敏感（原本帶 "i"）。不分大小寫會讓 app / flash-lite / on_axis /
+    // 0.58 s 這種小寫普通字命中 APP、LITE、ON、S —— 一份純技術文件因此被貼上四個假持股
+    // 標籤、訊號誤標成「碰到持股要決策」。真實代號一律大寫，去掉旗標；六份已入庫檔實測
+    // 真命中一個都沒掉。與 scripts/data_readiness/fred_intake_summary.py 的 match_tickers
+    // 同步改動，兩邊必須一致（helper 是主路徑，本函式是它失敗時的備援）。
+    const pattern = new RegExp(`(?<![A-Za-z0-9])${ticker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![A-Za-z0-9])`);
     if (pattern.test(text)) {
       hits.push(ticker);
       seen.add(ticker);
