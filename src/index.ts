@@ -845,7 +845,12 @@ async function runClaudeStreaming(
     if (opts.configDir) ensureIsolatedCreds(opts.configDir);
     stoppedSessions.delete(opts.sessionId);
     result = await runClaudeStreamingOnce(effectiveOpts);
-    if (stoppedSessions.has(opts.sessionId)) return result;
+    if (stoppedSessions.has(opts.sessionId)) {
+      const partial = result.text && !result.text.startsWith("(no output)") ? result.text : "";
+      return { ...result, text: partial ? `${partial}
+
+⏹️ *已被叫停，以上是停前的半成品。*` : "⏹️ *已被叫停。*" };
+    }
 
     // Session-id collision self-heal: a prior failed attempt (e.g. a 401) can leave the
     // session .jsonl on disk while the caller still treats the session as fresh (passes
