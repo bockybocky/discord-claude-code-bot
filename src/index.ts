@@ -549,6 +549,9 @@ async function fetchThreadHistory(
 // --- Streaming Runner ---
 
 const running = new Map<string, ChildProcess>();
+type RunTrace = { toolCount: number; lastTool?: string; files: string[]; lastText: string; pid?: number };
+const runTrace = new Map<string, RunTrace>();
+const stoppedSessions = new Set<string>(); // /stop 叫停過的 session：重試迴圈不得再拉起
 
 type StreamCallbacks = {
   onText?: (fullText: string) => void;
@@ -680,6 +683,7 @@ function runClaudeStreamingOnce(opts: {
     });
 
     running.set(opts.sessionId, child);
+    runTrace.set(opts.sessionId, { toolCount: 0, files: [], lastText: "", pid: child.pid });
 
     let buffer = "";
     let stderrBuf = "";
@@ -710,10 +714,23 @@ function runClaudeStreamingOnce(opts: {
                 messageText += block.text || "";
               } else if (block.type === "tool_use" && block.name) {
                 opts.callbacks?.onToolUse?.(block.name);
+                const trace = runTrace.get(opts.sessionId);
+                if (trace) {
+                  trace.toolCount += 1;
+                  trace.lastTool = block.name;
+                  if (block.name === "Edit" || block.name === "Write" || block.name === "MultiEdit" || block.name === "NotebookEdit") {
+                    const filePath = block.input?.file_path ?? block.input?.notebook_path;
+                    if (typeof filePath === "string" && filePath && !trace.files.includes(filePath)) {
+                      trace.files.push(filePath);
+                    }
+                  }
+                }
               }
             }
             if (messageText && messageText !== lastSeenText) {
               lastSeenText = messageText;
+              const trace = runTrace.get(opts.sessionId);
+              if (trace) trace.lastText = messageText;
               opts.callbacks?.onText?.(messageText);
             }
           }
@@ -826,7 +843,9 @@ async function runClaudeStreaming(
     // leaves both retries spending the same dead file. 2026-09-18: three Fred intake
     // summaries failed this exact way while main creds were valid the whole time.
     if (opts.configDir) ensureIsolatedCreds(opts.configDir);
+    stoppedSessions.delete(opts.sessionId);
     result = await runClaudeStreamingOnce(effectiveOpts);
+    if (stoppedSessions.has(opts.sessionId)) return result;
 
     // Session-id collision self-heal: a prior failed attempt (e.g. a 401) can leave the
     // session .jsonl on disk while the caller still treats the session as fresh (passes
@@ -3720,7 +3739,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           "`/new` — clear context, start new conversation (thread only)",
           "`/model <name>` — switch model (e.g. sonnet, opus, haiku)",
           "`/cd <path>` — switch working directory",
-          "`/stop` — kill running task (thread only)",
+          "`/stop` — 停止這個討論串正在跑的任務，並回報做到哪",
           "`/sessions` — list all sessions",
           "`/resume-local [session]` — resume a local terminal CC session",
           "`/handback` — hand session back to terminal",
@@ -3781,17 +3800,63 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (commandName === "stop") {
-      if (!interaction.channel?.isThread()) {
-        await interaction.reply({ content: "This command only works in threads.", ephemeral: true });
-        return;
-      }
-      const threadId = interaction.channelId;
-      const entry = threadMap[threadId];
-      if (entry && running.has(entry.sessionId)) {
-        running.get(entry.sessionId)!.kill("SIGTERM");
-        await interaction.reply({ content: "Stopped.", ephemeral: true });
-      } else {
-        await interaction.reply({ content: "Nothing running.", ephemeral: true });
+      try {
+        if (!interaction.channel?.isThread()) {
+          await interaction.reply({ content: "這個指令只能在討論串裡用。", ephemeral: true });
+          return;
+        }
+        const threadId = interaction.channelId;
+        const entry = threadMap[threadId];
+        if (!(entry && running.has(entry.sessionId))) {
+          await interaction.reply({ content: "這個討論串現在沒有在跑的任務。", ephemeral: true });
+          return;
+        }
+        const sessionId = entry.sessionId;
+        const child = running.get(sessionId)!;
+        const pid = child.pid ?? runTrace.get(sessionId)?.pid;
+        stoppedSessions.add(sessionId);
+        await interaction.reply({ content: "收到，正在停止…", ephemeral: true });
+        if (process.platform === "win32" && pid) {
+          await new Promise<void>((resolve) => {
+            execFile("taskkill", ["/PID", String(pid), "/T", "/F"], () => resolve());
+          });
+        } else {
+          child.kill("SIGTERM");
+        }
+        const deadline = Date.now() + 15_000;
+        while (running.has(sessionId) && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 500));
+        }
+        const ended = !running.has(sessionId);
+        const trace = runTrace.get(sessionId);
+        const files = trace?.files ?? [];
+        const fileLine = files.length === 0
+          ? "沒有改檔"
+          : files.length <= 10
+            ? files.join("、")
+            : `${files.slice(0, 10).join("、")}…等共 ${files.length} 個`;
+        const resultLine = ended
+          ? "程序已結束"
+          : `⚠️ 15 秒內沒確認結束（PID ${pid ?? "未知"}），請手動查`;
+        const lastBit = (trace?.lastText ?? "").slice(-300);
+        const body = [
+          "⏹️ 已停止",
+          `- 結果：${resultLine}`,
+          `- 跑了 ${trace?.toolCount ?? 0} 個工具步驟（最後一個：${trace?.lastTool ?? "無"}）`,
+          `- 改過的檔案：${fileLine}`,
+          `- 停前最後一句話：${lastBit || "（沒有）"}`,
+          "- 沒有自動復原。要退回的話，跟我說要退哪個檔。",
+        ].join("\n");
+        await interaction.channel.send(body.slice(0, 2000));
+      } catch (err) {
+        const msg = `停止時出錯：${(err as Error).message ?? err}`;
+        try {
+          if (interaction.replied || interaction.deferred) {
+            await interaction.followUp({ content: msg, ephemeral: true });
+          } else {
+            await interaction.reply({ content: msg, ephemeral: true });
+          }
+        } catch { /* 回覆管道也壞了，不要讓機器人當掉 */ }
       }
       return;
     }
